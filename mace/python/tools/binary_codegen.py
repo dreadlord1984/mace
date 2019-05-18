@@ -1,4 +1,4 @@
-# Copyright 2018 Xiaomi, Inc.  All rights reserved.
+# Copyright 2018 The MACE Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ import struct
 import jinja2
 
 import numpy as np
+import six
+
 
 # python mace/python/tools/binary_codegen.py \
 #     --binary_dirs=${BIN_FILE} \
@@ -39,11 +41,11 @@ def generate_cpp_source(binary_dirs, binary_file_name, variable_name):
         with open(binary_path, "rb") as f:
             binary_array = np.fromfile(f, dtype=np.uint8)
 
-        print "Generate binary from", binary_path
+        six.print_("Generate binary from", binary_path)
         idx = 0
         size, = struct.unpack("Q", binary_array[idx:idx + 8])
         idx += 8
-        for _ in xrange(size):
+        for _ in six.moves.range(size):
             key_size, = struct.unpack("i", binary_array[idx:idx + 4])
             idx += 4
             key, = struct.unpack(

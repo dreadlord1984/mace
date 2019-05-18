@@ -7,17 +7,19 @@ option optimize_for = LITE_RUNTIME;
 // For better compatibility,
 // the mace.proto is refered from tensorflow and caffe2.
 
-enum NetMode {
-  INIT = 0;
-  NORMAL = 1;
-}
-
 enum DataType {
   DT_INVALID = 0;
   DT_FLOAT = 1;
   DT_UINT8 = 2;
   DT_HALF = 3;
   DT_INT32 = 4;
+  DT_FLOAT16 = 5;
+}
+
+enum MemoryType {
+  CPU_BUFFER = 0;
+  GPU_BUFFER = 1;
+  GPU_IMAGE = 2;
 }
 
 message ConstTensor {
@@ -28,6 +30,11 @@ message ConstTensor {
   optional string name = 5;
   optional int64 offset = 6;
   optional int64 data_size = 7;
+  optional float scale = 8;
+  optional int32 zero_point = 9;
+  optional float minval = 10;
+  optional float maxval = 11;
+  optional bool quantized = 12 [default = false];
 
   optional uint32 node_id = 100;
 }
@@ -51,14 +58,23 @@ message OutputShape {
   repeated int64 dims = 1;
 }
 
+message QuantizeActivationInfo {
+  optional float scale = 1;
+  optional int32 zero_point = 2;
+  optional float minval = 3;  // hexagon uses min/max
+  optional float maxval = 4;
+}
+
 message OperatorDef {
   repeated string input = 1;
   repeated string output = 2;
   optional string name = 3;
   optional string type = 4;
-  repeated Argument arg = 5;
-  repeated OutputShape output_shape = 6;
-  repeated DataType output_type = 7;
+  optional int32 device_type = 5;
+  repeated Argument arg = 6;
+  repeated OutputShape output_shape = 7;
+  repeated DataType output_type = 8;
+  repeated QuantizeActivationInfo quantize_info = 9;
 
   repeated int32 mem_id = 10;
 
@@ -70,43 +86,22 @@ message OperatorDef {
   repeated int32 out_max_byte_size = 104;  // only support 32-bit len
 }
 
-// for memory optimization
-message MemoryBlock {
-  optional int32 mem_id = 1;
-  optional uint32 x = 2;
-  optional uint32 y = 3;
-}
-message MemoryArena {
-  repeated MemoryBlock mem_block = 1;
-}
-
-// for hexagon mace-nnlib
-message InputInfo {
+message InputOutputInfo {
   optional string name = 1;
   optional int32 node_id = 2;
   repeated int32 dims = 3;
   optional int32 max_byte_size = 4;  // only support 32-bit len
   optional DataType data_type = 5 [default = DT_FLOAT];
-}
-message OutputInfo {
-  optional string name = 1;
-  optional int32 node_id = 2;
-  repeated int32 dims = 3;
-  optional int32 max_byte_size = 4;  // only support 32-bit len
-  optional DataType data_type = 5 [default = DT_FLOAT];
+  optional int32 data_format = 6 [default = 1];  // NHWC
+  optional float scale = 7;
+  optional int32 zero_point = 8;
 }
 
 message NetDef {
-  optional string name = 1;
-  repeated OperatorDef op = 2;
-  optional string version = 3;
-  repeated Argument arg = 4;
-  repeated ConstTensor tensors = 5;
+  repeated OperatorDef op = 1;
+  repeated Argument arg = 2;
+  repeated ConstTensor tensors = 3;
 
-  // for mem optimization
-  optional MemoryArena mem_arena = 10;
-
-  // for hexagon mace-nnlib
-  repeated InputInfo input_info = 100;
-  repeated OutputInfo output_info = 101;
+  repeated InputOutputInfo input_info = 100;
+  repeated InputOutputInfo output_info = 101;
 }

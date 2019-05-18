@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,36 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "mace/ops/identity.h"
+
+#include "mace/core/operator.h"
 
 namespace mace {
 namespace ops {
 
-void Register_Identity(OperatorRegistry *op_registry) {
-  MACE_REGISTER_OPERATOR(op_registry, OpKeyBuilder("Identity")
-                                          .Device(DeviceType::CPU)
-                                          .TypeConstraint<float>("T")
-                                          .Build(),
-                         IdentityOp<DeviceType::CPU, float>);
-  MACE_REGISTER_OPERATOR(op_registry, OpKeyBuilder("Identity")
-                                          .Device(DeviceType::CPU)
-                                          .TypeConstraint<int32_t>("T")
-                                          .Build(),
-                         IdentityOp<DeviceType::CPU, int32_t>);
+template <DeviceType D, class T>
+class IdentityOp : public Operation {
+ public:
+  explicit IdentityOp(OpConstructContext *context)
+      : Operation(context) {}
 
+  MaceStatus Run(OpContext *context) override {
+    MACE_UNUSED(context);
+    const Tensor *input = this->Input(0);
+    Tensor *output = this->Output(0);
+    output->ReuseTensorBuffer(*input);
+    return MaceStatus::MACE_SUCCESS;
+  }
+};
+
+void RegisterIdentity(OpRegistryBase *op_registry) {
+  MACE_REGISTER_OP(op_registry, "Identity", IdentityOp,
+                   DeviceType::CPU, float);
+  MACE_REGISTER_OP(op_registry, "Identity", IdentityOp,
+                   DeviceType::CPU, int32_t);
 #ifdef MACE_ENABLE_OPENCL
-  MACE_REGISTER_OPERATOR(op_registry, OpKeyBuilder("Identity")
-                                          .Device(DeviceType::GPU)
-                                          .TypeConstraint<float>("T")
-                                          .Build(),
-                         IdentityOp<DeviceType::GPU, float>);
-
-  MACE_REGISTER_OPERATOR(op_registry, OpKeyBuilder("Identity")
-                                          .Device(DeviceType::GPU)
-                                          .TypeConstraint<half>("T")
-                                          .Build(),
-                         IdentityOp<DeviceType::GPU, half>);
-#endif
+  MACE_REGISTER_OP(op_registry, "Identity", IdentityOp,
+                   DeviceType::GPU, float);
+  MACE_REGISTER_OP(op_registry, "Identity", IdentityOp,
+                   DeviceType::GPU, half);
+#endif  // MACE_ENABLE_OPENCL
 }
 
 }  // namespace ops

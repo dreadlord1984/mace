@@ -5,96 +5,103 @@ You can create a custom op if it is not supported yet.
 
 To add a custom op, you need to follow these steps:
 
-Define the Op class
---------------------
-Define the new Op class in `mace/ops/my_custom_op.h`.
+Implement the Operation
+-----------------------
+The Best way is to refer to the implementation of other operator(e.g. `/mace/ops/activation.cc`)
 
+Define the new Op class in `mace/ops/my_custom_op.cc`.
+1. ARM kernels: Kernel about NEON is located at `mace/ops/arm/my_custom_op.cc`
+2. GPU kernels: OpenCL kernel API is defined in `mace/ops/opencl/my_custom_op.h`, 
+    * Kernel based on Image is realized in `mace/ops/opencl/image/my_custom_op.cc`,
+    * Kernel based on Buffer is realized in `mace/ops/opencl/buffer/my_custom_op.cc`.
+    * OpenCL kernel file is realized in `mace/ops/opencl/cl/my_custom_op.cl`.
+    * Add the path of opencl kernel file in file `mace/repository/opencl-kernel/opencl_kernel_configure.bzl`
+ 
+The structure of Op is like the following code.
 ```c++
-#ifndef MACE_OPS_MY_CUSTOM_OP_H_
-#define MACE_OPS_MY_CUSTOM_OP_H_
-
 #include "mace/core/operator.h"
-#include "mace/kernels/my_custom_op.h"
 
 namespace mace {
 namespace ops {
 
-template <DeviceType D, typename T>
-class MyCustomOp : public Operator<D, T> {
- public:
-  MyCustomOp(const OperatorDef &op_def, Workspace *ws)
-      : Operator<D, T>(op_def, ws),
-        functor_() {}
+template <DeviceType D, class T>
+class MyCustomOp;
 
-  bool Run(StatsFuture *future) override {
-    const Tensor *input = this->Input(INPUT);
-    Tensor *output = this->Output(OUTPUT);
-   
-    functor_(input, output, future);
-    return true;
-  }
+template <>
+class MyCustomOp<DeviceType::CPU, float> : public Operation {
+...
+}
 
- protected:
-  OP_INPUT_TAGS(INPUT);
-  OP_OUTPUT_TAGS(OUTPUT);
-
- private:
-  kernels::MyCustomOpFunctor<D, T> functor_;
+#ifdef MACE_ENABLE_OPENCL
+template <typename T>
+class MyCustomOp<DeviceType::GPU, T> : public Operation {
+...
 };
+#endif  // MACE_ENABLE_OPENCL
 
-}  // namespace ops
-}  // namespace mace
+void RegisterMyCustomOp(OpRegistryBase *op_registry) {
+  MACE_REGISTER_OP(op_registry, "MyCustomOp", MyCustomOp,
+                   DeviceType::CPU, float);
 
-#endif  // MACE_OPS_MY_CUSTOM_OP_H_
+#ifdef MACE_ENABLE_OPENCL
+  MACE_REGISTER_OP(op_registry, "MyCustomOp", MyCustomOp,
+                   DeviceType::GPU, float);
 
-```
-
-Register the new Op
---------------------
-Define the Ops registering function in `mace/ops/my_custom_op.cc`.
-```c++
-#include "mace/ops/my_custom_op.h"
-
-namespace mace {
-namespace ops {
-
-void Register_My_Custom_Op(OperatorRegistry *op_registry) {
-  REGISTER_OPERATOR(op_registry, OpKeyBuilder("my_custom_op")
-                                     .Device(DeviceType::CPU)
-                                     .TypeConstraint<float>("T")
-                                     .Build(),
-                    Custom_Op<DeviceType::CPU, float>);
-
-  REGISTER_OPERATOR(op_registry, OpKeyBuilder("my_custom_op")
-                                     .Device(DeviceType::OPENCL)
-                                     .TypeConstraint<float>("T")
-                                     .Build(),
-                    Custom_Op<DeviceType::OPENCL, float>);
-
-  REGISTER_OPERATOR(op_registry, OpKeyBuilder("my_custom_op")
-                                     .Device(DeviceType::OPENCL)
-                                     .TypeConstraint<half>("T")
-                                     .Build(),
-                    Custom_Op<DeviceType::OPENCL, half>);
+  MACE_REGISTER_OP(op_registry, "MyCustomOp", MyCustomOp,
+                   DeviceType::GPU, half);
+#endif  // MACE_ENABLE_OPENCL
 }
 
 }  // namespace ops
 }  // namespace mace
 
 ```
-And then register the new Op in `mace/core/operator.cc`.
 
-Implement the Op kernel code
-----------------------------
-You need to implement the CPU kernel in a `mace/kernels/my_custom_op.h` and
-optionally OpenCL kernel in `mace/kernels/kernels/my_custom_op_opencl.cc` and
-`mace/kernels/kernels/cl/my_custom_op.cl`. You can also optimize the CPU
-kernel with NEON.
+Register the Operation
+-----------------------
+Register the new Op in `mace/ops/ops_register.cc`.
+```
+#include "mace/ops/ops_register.h"
 
-Add test and benchmark
+namespace mace {
+namespace ops {
+// Keep in lexicographical order
+
+...
+
+extern void RegisterMyCustomOp(OpRegistryBase *op_registry);
+
+...
+
+}  // namespace ops
+
+
+OpRegistry::OpRegistry() : OpRegistryBase() {
+  // Keep in lexicographical order
+
+  ...
+
+  ops::RegisterMyCustomOp(this);
+
+  ...
+
+}
+
+}  // namespace mace
+```
+Add UTs
 ----------------------
+Add operation unit tests in `mace/ops/my_custom_op_test.cc`
+
+Add benchmark
+----------------------
+Add operation benchmark in `mace/ops/my_custom_op_benchmark.cc`
 It's strongly recommended to add unit tests and micro benchmarks for your
 new Op. If you wish to contribute back, it's required.
+
+Add Op in model converter
+-------------------------
+You need to add this new Op in the model converter.
 
 Document the new Op
 ---------------------

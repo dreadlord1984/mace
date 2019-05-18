@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,11 @@
 #ifndef MACE_CORE_TENSOR_H_
 #define MACE_CORE_TENSOR_H_
 
+#include <algorithm>
+#include <functional>
+#include <numeric>
 #include <string>
 #include <vector>
-#include <functional>
 
 #include "mace/core/buffer.h"
 #include "mace/core/preallocated_pooled_allocator.h"
@@ -25,7 +27,6 @@
 #ifdef MACE_ENABLE_OPENCL
 #include "mace/core/runtime/opencl/cl2_header.h"
 #endif
-#include "mace/public/mace.h"
 #include "mace/utils/logging.h"
 
 #ifdef MACE_ENABLE_NEON
@@ -38,35 +39,35 @@
 namespace mace {
 
 #define MACE_SINGLE_ARG(...) __VA_ARGS__
-#define MACE_CASE(TYPE, STATEMENTS)             \
+#define MACE_CASE(TYPE, STATEMENTS)   \
   case DataTypeToEnum<TYPE>::value: { \
     typedef TYPE T;                   \
-    STATEMENTS;                            \
+    STATEMENTS;                       \
     break;                            \
   }
 
-#ifdef MACE_ENABLE_OPENCL
-#define MACE_TYPE_ENUM_SWITCH(                                     \
-    TYPE_ENUM, STATEMENTS, INVALID_STATEMENTS, DEFAULT_STATEMENTS) \
-  switch (TYPE_ENUM) {                                             \
-    MACE_CASE(half, MACE_SINGLE_ARG(STATEMENTS))                   \
-    MACE_CASE(float, MACE_SINGLE_ARG(STATEMENTS))                  \
-    MACE_CASE(uint8_t, MACE_SINGLE_ARG(STATEMENTS))                \
-    MACE_CASE(int32_t, MACE_SINGLE_ARG(STATEMENTS))                \
-    case DT_INVALID:                                               \
-      INVALID_STATEMENTS;                                          \
-      break;                                                       \
-    default:                                                       \
-      DEFAULT_STATEMENTS;                                          \
-      break;                                                       \
-  }
+#if defined(MACE_ENABLE_NEON) && defined(__ANDROID__)
+#define MACE_TYPE_ENUM_SWITCH_CASE_NEON(STATEMENTS)             \
+  MACE_CASE(float16_t, MACE_SINGLE_ARG(STATEMENTS))
 #else
+#define MACE_TYPE_ENUM_SWITCH_CASE_NEON(STATEMENTS)
+#endif
+
+#if MACE_ENABLE_OPENCL
+#define MACE_TYPE_ENUM_SWITCH_CASE_OPENCL(STATEMENTS)           \
+  MACE_CASE(half, MACE_SINGLE_ARG(STATEMENTS))
+#else
+#define MACE_TYPE_ENUM_SWITCH_CASE_OPENCL(STATEMENTS)
+#endif
+
 #define MACE_TYPE_ENUM_SWITCH(                                     \
     TYPE_ENUM, STATEMENTS, INVALID_STATEMENTS, DEFAULT_STATEMENTS) \
   switch (TYPE_ENUM) {                                             \
     MACE_CASE(float, MACE_SINGLE_ARG(STATEMENTS))                  \
     MACE_CASE(uint8_t, MACE_SINGLE_ARG(STATEMENTS))                \
     MACE_CASE(int32_t, MACE_SINGLE_ARG(STATEMENTS))                \
+    MACE_TYPE_ENUM_SWITCH_CASE_NEON(STATEMENTS)                    \
+    MACE_TYPE_ENUM_SWITCH_CASE_OPENCL(STATEMENTS)                  \
     case DT_INVALID:                                               \
       INVALID_STATEMENTS;                                          \
       break;                                                       \
@@ -74,7 +75,6 @@ namespace mace {
       DEFAULT_STATEMENTS;                                          \
       break;                                                       \
   }
-#endif
 
 // `TYPE_ENUM` will be converted to template `T` in `STATEMENTS`
 #define MACE_RUN_WITH_TYPE_ENUM(TYPE_ENUM, STATEMENTS)                       \
@@ -96,32 +96,56 @@ inline std::ostream &operator<<(std::ostream &os, unsigned char c) {
 }
 }  // namespace numerical_chars
 
-enum DataFormat { NHWC = 0, NCHW = 1, HWOI = 2, OIHW = 3, HWIO = 4 };
-
 class Tensor {
  public:
-  Tensor(Allocator *alloc, DataType type)
+  Tensor(Allocator *alloc, DataType type,
+         bool is_weight = false,
+         const std::string name = "")
       : allocator_(alloc),
         dtype_(type),
         buffer_(nullptr),
         is_buffer_owner_(true),
-        name_("") {}
+        unused_(false),
+        name_(name),
+        is_weight_(is_weight),
+        scale_(0.f),
+        zero_point_(0),
+        minval_(0.f),
+        maxval_(0.f) {}
 
-  Tensor(BufferBase *buffer, DataType dtype)
+  Tensor(BufferBase *buffer, DataType dtype,
+         bool is_weight = false,
+         const std::string name = "")
     : dtype_(dtype),
       buffer_(buffer),
       is_buffer_owner_(false),
-      name_("") {}
+      unused_(false),
+      name_(name),
+      is_weight_(is_weight),
+      scale_(0.f),
+      zero_point_(0),
+      minval_(0.f),
+      maxval_(0.f) {}
 
-  Tensor(const BufferSlice &buffer_slice, DataType dtype)
+  Tensor(const BufferSlice &buffer_slice,
+         DataType dtype,
+         bool is_weight = false,
+         const std::string name = "")
       : dtype_(dtype),
         buffer_slice_(buffer_slice),
         is_buffer_owner_(false),
-        name_("") {
+        unused_(false),
+        name_(name),
+        is_weight_(is_weight),
+        scale_(0.f),
+        zero_point_(0),
+        minval_(0.f),
+        maxval_(0.f) {
     buffer_ = &buffer_slice_;
   }
 
-  Tensor() : Tensor(GetDeviceAllocator(CPU), DT_FLOAT) {}
+  explicit Tensor(bool is_weight = false)
+      : Tensor(GetCPUAllocator(), DT_FLOAT, is_weight) {}
 
   ~Tensor() {
     if (is_buffer_owner_ && buffer_ != nullptr) {
@@ -129,17 +153,53 @@ class Tensor {
     }
   }
 
+  inline std::string name() const { return name_; }
+
   inline DataType dtype() const { return dtype_; }
 
   inline void SetDtype(DataType dtype) { dtype_ = dtype; }
 
+  inline bool unused() const { return unused_; }
+
   inline const std::vector<index_t> &shape() const { return shape_; }
+
+  inline std::vector<index_t> max_shape() const {
+    if (shape_configured_.empty()) {
+      return shape();
+    } else {
+      auto &_shape = shape();
+      std::vector<index_t> max_shape(_shape.size());
+      MACE_CHECK(_shape.size() == shape_configured_.size());
+      for (size_t i = 0; i < shape_configured_.size(); ++i) {
+        max_shape[i] = std::max(_shape[i], shape_configured_[i]);
+      }
+      return max_shape;
+    }
+  }
+
+  inline index_t max_size() const {
+    auto _max_shape = max_shape();
+    return std::accumulate(_max_shape.begin(),
+                           _max_shape.end(),
+                           1,
+                           std::multiplies<index_t>());
+  }
+
+  inline index_t raw_max_size() const { return max_size() * SizeOfType(); }
+
+  inline void SetShapeConfigured(const std::vector<index_t> &shape_configured) {
+    shape_configured_ = shape_configured;
+  }
+
+  inline const std::vector<index_t> &buffer_shape() const {
+    return buffer_shape_;
+  }
 
   inline index_t dim_size() const { return shape_.size(); }
 
   inline index_t dim(unsigned int index) const {
-    MACE_CHECK(index < shape_.size(), "Dim out of range: ", index, " >= ",
-               shape_.size());
+    MACE_CHECK(index < shape_.size(),
+               name_, ": Dim out of range: ", index, " >= ", shape_.size());
     return shape_[index];
   }
 
@@ -152,21 +212,40 @@ class Tensor {
 
   inline bool has_opencl_image() const {
     return buffer_ != nullptr && !buffer_->OnHost() &&
-           typeid(*buffer_) == typeid(Image);
+           buffer_->buffer_type() == core::BufferType::BT_IMAGE;
   }
 
   inline bool has_opencl_buffer() const {
     return buffer_ != nullptr && !buffer_->OnHost() && !has_opencl_image();
   }
 
+  inline MemoryType memory_type() const {
+    MACE_CHECK(buffer_ != nullptr, "Tensor ", name_, " is empty");
+    if (buffer_->OnHost()) {
+      return MemoryType::CPU_BUFFER;
+    } else if (buffer_->buffer_type() == core::BufferType::BT_IMAGE) {
+      return MemoryType::GPU_IMAGE;
+    } else {
+      return MemoryType::GPU_BUFFER;
+    }
+  }
+
+  inline void set_data_format(DataFormat data_format) {
+    data_format_ = data_format;
+  }
+
+  inline DataFormat data_format() const {
+    return data_format_;
+  }
+
 #ifdef MACE_ENABLE_OPENCL
   inline cl::Image *opencl_image() const {
-    MACE_CHECK(has_opencl_image(), "do not have image");
+    MACE_CHECK(has_opencl_image(), name_, " do not have image");
     return static_cast<cl::Image *>(buffer_->buffer());
   }
 
   inline cl::Buffer *opencl_buffer() const {
-    MACE_CHECK(has_opencl_buffer(), "do not have opencl buffer");
+    MACE_CHECK(has_opencl_buffer(), name_, " do not have opencl buffer");
     return static_cast<cl::Buffer *>(buffer_->buffer());
   }
 #endif
@@ -195,6 +274,10 @@ class Tensor {
     return static_cast<T *>(buffer_->raw_mutable_data());
   }
 
+  inline void MarkUnused() {
+    unused_ = true;
+  }
+
   inline void Clear() {
     MACE_CHECK_NOTNULL(buffer_);
     buffer_->Clear(raw_size());
@@ -202,18 +285,30 @@ class Tensor {
 
   inline void Reshape(const std::vector<index_t> &shape) {
     shape_ = shape;
-    MACE_CHECK(raw_size() <= buffer_->size());
+    if (has_opencl_image()) {
+      MACE_CHECK(raw_size() <= 4 * buffer_->size(),
+                 "Must satisfy: ", raw_size(), " <= ", 4 * buffer_->size());
+    } else {
+      MACE_CHECK(raw_size() <= buffer_->size(),
+                 "Must satisfy: ", raw_size(), " <= ", buffer_->size());
+    }
   }
 
   inline MaceStatus Resize(const std::vector<index_t> &shape) {
     shape_ = shape;
+    buffer_shape_ = shape;
     image_shape_.clear();
     if (buffer_ != nullptr) {
-      MACE_CHECK(!has_opencl_image(), "Cannot resize image, use ResizeImage.");
-      if (raw_size() + MACE_EXTRA_BUFFER_PAD_SIZE > buffer_->size()) {
-        LOG(WARNING) << "Resize buffer from size " << buffer_->size() << " to "
-                     << raw_size() + MACE_EXTRA_BUFFER_PAD_SIZE;
-        return buffer_->Resize(raw_size() + MACE_EXTRA_BUFFER_PAD_SIZE);
+      MACE_CHECK(!has_opencl_image(),
+                 name_, ": Cannot resize image, use ResizeImage.");
+      const index_t apply_size = raw_size()
+          + ((buffer_ != &buffer_slice_) ? MACE_EXTRA_BUFFER_PAD_SIZE : 0);
+      if (apply_size > buffer_->size()) {
+        LOG(WARNING) << name_ << ": Resize buffer from size " << buffer_->size()
+                     << " to " << apply_size;
+        MACE_CHECK(buffer_ != &buffer_slice_,
+                   ": Cannot resize tensor with buffer slice");
+        return buffer_->Resize(apply_size);
       }
       return MaceStatus::MACE_SUCCESS;
     } else {
@@ -235,26 +330,29 @@ class Tensor {
     allocator_ = other.allocator_;
     dtype_ = other.dtype_;
     shape_ = other.shape_;
+    buffer_shape_ = other.buffer_shape_;
     image_shape_ = other.image_shape_;
   }
 
   inline MaceStatus ResizeImage(const std::vector<index_t> &shape,
                                 const std::vector<size_t> &image_shape) {
     shape_ = shape;
+    buffer_shape_ = shape;
     image_shape_ = image_shape;
     if (buffer_ == nullptr) {
       MACE_CHECK(is_buffer_owner_);
-      buffer_ = new Image();
+      buffer_ = new Image(allocator_);
       return buffer_->Allocate(image_shape, dtype_);
     } else {
-      MACE_CHECK(has_opencl_image(), "Cannot ResizeImage buffer, use Resize.");
-      Image *image = dynamic_cast<Image *>(buffer_);
-      MACE_CHECK(image_shape[0] <= image->image_shape()[0] &&
-                     image_shape[1] <= image->image_shape()[1],
+      MACE_CHECK(has_opencl_image(),
+                 name_, ": Cannot ResizeImage buffer, use Resize.");
+      MACE_CHECK(image_shape[0] <= buffer_->shape()[0] &&
+                     image_shape[1] <= buffer_->shape()[1],
                  "tensor (source op ", name_,
-                 "): current physical image shape: ", image->image_shape()[0],
-                 ", ", image->image_shape()[1], " < logical image shape: ",
-                 image_shape[0], ", ", image_shape[1]);
+                 "): current logical image shape:",
+                 image_shape[0], ", ", image_shape[1],
+                 " > physical image shape: ",
+                 buffer_->shape()[0], ", ", buffer_->shape()[1]);
       return MaceStatus::MACE_SUCCESS;
     }
   }
@@ -305,8 +403,6 @@ class Tensor {
 
   inline BufferBase *UnderlyingBuffer() const { return buffer_; }
 
-  inline void SetSourceOpName(const std::string name) { name_ = name; }
-
   inline void DebugPrint() const {
     using namespace numerical_chars;  // NOLINT(build/namespaces)
     std::stringstream os;
@@ -354,15 +450,67 @@ class Tensor {
     MACE_DISABLE_COPY_AND_ASSIGN(MappingGuard);
   };
 
+  inline bool is_weight() const {
+    return is_weight_;
+  }
+
+  inline float scale() const {
+    return scale_;
+  }
+
+  inline int32_t zero_point() const {
+    return zero_point_;
+  }
+
+  // hexagon now uses min/max instead of scale and zero
+  inline float minval() const {
+    return minval_;
+  }
+
+  inline float maxval() const {
+    return maxval_;
+  }
+
+  inline void SetScale(float scale) {
+    scale_ = scale;
+  }
+
+  inline void SetZeroPoint(int32_t zero_point) {
+    zero_point_ = zero_point;
+  }
+
+  inline void SetIsWeight(bool is_weight) {
+    is_weight_ = is_weight;
+  }
+
+  inline void SetMinVal(float minval) {
+    minval_ = minval;
+  }
+
+  inline void SetMaxVal(float maxval) {
+    maxval_ = maxval;
+  }
+
  private:
   Allocator *allocator_;
   DataType dtype_;
+  // the shape of buffer(logical)
   std::vector<index_t> shape_;
+  std::vector<index_t> shape_configured_;
   std::vector<size_t> image_shape_;
+  // the shape of buffer(physical storage)
+  std::vector<index_t> buffer_shape_;
   BufferBase *buffer_;
   BufferSlice buffer_slice_;
   bool is_buffer_owner_;
+  bool unused_;
   std::string name_;
+  bool is_weight_;
+  float scale_;
+  int32_t zero_point_;
+  float minval_;
+  float maxval_;
+  DataFormat data_format_;  // used for 4D input/output tensor
 
   MACE_DISABLE_COPY_AND_ASSIGN(Tensor);
 };

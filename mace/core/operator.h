@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,24 +16,155 @@
 #define MACE_CORE_OPERATOR_H_
 
 #include <memory>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
-#include <map>
 
 #include "mace/core/arg_helper.h"
-#include "mace/core/future.h"
-#include "mace/core/registry.h"
+#include "mace/core/op_context.h"
 #include "mace/core/tensor.h"
 #include "mace/core/workspace.h"
 #include "mace/proto/mace.pb.h"
-#include "mace/public/mace.h"
+#ifdef MACE_ENABLE_OPENCL
+#include "mace/core/runtime/opencl/opencl_util.h"
+#endif  // MACE_ENABLE_OPENCL
 
 namespace mace {
 
-class OperatorBase {
+// OpConditionContext has all information used for choosing proper Op
+class OpConditionContext {
  public:
-  explicit OperatorBase(const OperatorDef &operator_def, Workspace *ws);
-  virtual ~OperatorBase() noexcept {}
+  typedef std::unordered_map<std::string, std::vector<index_t>> TensorShapeMap;
+  OpConditionContext(const Workspace *ws, TensorShapeMap *info);
+  ~OpConditionContext() = default;
+
+  void set_operator_def(const OperatorDef* operator_def);
+
+  inline const OperatorDef *operator_def() const {
+    return operator_def_;
+  }
+
+  inline const Workspace *workspace() const {
+    return ws_;
+  }
+
+  inline void set_device(Device* device) {
+    device_ = device;
+  }
+
+  inline Device *device() const {
+    return device_;
+  }
+
+  inline TensorShapeMap *tensor_shape_info() const {
+    return tensor_shape_info_;
+  }
+
+  void set_output_mem_type(MemoryType type);
+
+  inline MemoryType output_mem_type() const {
+    return output_mem_type_;
+  }
+
+  void SetInputInfo(size_t idx, MemoryType mem_type, DataType dt);
+
+  MemoryType GetInputMemType(size_t idx) const;
+
+  DataType GetInputDataType(size_t idx) const;
+
+#ifdef MACE_ENABLE_OPENCL
+  void SetInputOpenCLBufferType(size_t idx, OpenCLBufferType buffer_type);
+  OpenCLBufferType GetInputOpenCLBufferType(size_t idx) const;
+#endif  // MACE_ENABLE_OPENCL
+
+ private:
+  const OperatorDef *operator_def_;
+  const Workspace *ws_;
+  Device *device_;
+  TensorShapeMap *tensor_shape_info_;
+  // used for memory transform
+  std::vector<MemoryType> input_mem_types_;
+  std::vector<DataType> input_data_types_;
+  MemoryType output_mem_type_;  // there is only one output memory type now.
+#ifdef MACE_ENABLE_OPENCL
+  std::vector<OpenCLBufferType> input_opencl_buffer_types_;
+#endif  // MACE_ENABLE_OPENCL
+};
+
+// memory_optimizer, device
+class OpConstructContext {
+  typedef std::unordered_map<std::string, std::vector<index_t>> TensorShapeMap;
+
+ public:
+  explicit OpConstructContext(Workspace *ws);
+  ~OpConstructContext() = default;
+
+  void set_operator_def(std::shared_ptr<OperatorDef> operator_def);
+
+  inline std::shared_ptr<OperatorDef> operator_def() const {
+    return operator_def_;
+  }
+
+  inline Workspace *workspace() const {
+    return ws_;
+  }
+
+  inline void set_device(Device* device) {
+    device_ = device;
+  }
+
+  inline Device *device() const {
+    return device_;
+  }
+#ifdef MACE_ENABLE_OPENCL
+  inline MemoryType GetOpMemoryType() const {
+    return static_cast<MemoryType>(
+        ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
+            *operator_def_, OutputMemoryTypeTagName(),
+            static_cast<int>(MemoryType::CPU_BUFFER)));
+  }
+#endif  // MACE_ENABLE_OPENCL
+
+ private:
+  std::shared_ptr<OperatorDef> operator_def_;
+  Workspace *ws_;
+  Device *device_;
+};
+
+// memory_optimizer, device
+class OpInitContext {
+ public:
+  explicit OpInitContext(Workspace *ws, Device *device = nullptr);
+  ~OpInitContext() = default;
+
+  inline Workspace *workspace() const {
+    return ws_;
+  }
+
+  inline void set_device(Device *device) {
+    device_ = device;
+  }
+
+  inline Device *device() const {
+    return device_;
+  }
+
+ private:
+  Workspace *ws_;
+  Device *device_;
+};
+
+// Conventions
+// * If there exist format, NHWC is the default format
+// * The input/output format of CPU ops with float data type is NCHW
+// * The input/output format of GPU ops and CPU Quantization ops is NHWC
+// * Inputs' data type is same as the operation data type by default.
+// * The outputs' data type is same as the operation data type by default.
+class Operation {
+ public:
+  explicit Operation(OpConstructContext *context);
+  virtual ~Operation() = default;
 
   template <typename T>
   inline T GetOptionalArg(const std::string &name,
@@ -50,6 +181,10 @@ class OperatorBase {
         *operator_def_, name, default_value);
   }
 
+  inline DeviceType device_type() const {
+    return static_cast<DeviceType>(operator_def_->device_type());
+  }
+
   inline const Tensor *Input(unsigned int idx) {
     MACE_CHECK(idx < inputs_.size());
     return inputs_[idx];
@@ -63,7 +198,8 @@ class OperatorBase {
   inline const std::vector<Tensor *> &Outputs() { return outputs_; }
 
   // Run Op asynchronously (depends on device), return a future if not nullptr.
-  virtual MaceStatus Run(StatsFuture *future) = 0;
+  virtual MaceStatus Init(OpInitContext *);
+  virtual MaceStatus Run(OpContext *) = 0;
 
   inline const OperatorDef &debug_def() const {
     MACE_CHECK(has_debug_def(), "operator_def was null!");
@@ -71,57 +207,22 @@ class OperatorBase {
   }
 
   inline void set_debug_def(
-      const std::shared_ptr<const OperatorDef> &operator_def) {
+      const std::shared_ptr<OperatorDef> &operator_def) {
     operator_def_ = operator_def;
   }
 
   inline bool has_debug_def() const { return operator_def_ != nullptr; }
 
+  inline std::shared_ptr<OperatorDef> operator_def() {
+    return operator_def_;
+  }
+
  protected:
-  Workspace *operator_ws_;
-  std::shared_ptr<const OperatorDef> operator_def_;
+  std::shared_ptr<OperatorDef> operator_def_;
   std::vector<const Tensor *> inputs_;
   std::vector<Tensor *> outputs_;
 
-  MACE_DISABLE_COPY_AND_ASSIGN(OperatorBase);
-};
-
-template <DeviceType D, class T>
-class Operator : public OperatorBase {
- public:
-  explicit Operator(const OperatorDef &operator_def, Workspace *ws)
-      : OperatorBase(operator_def, ws) {
-    for (const std::string &input_str : operator_def.input()) {
-      const Tensor *tensor = ws->GetTensor(input_str);
-      MACE_CHECK(tensor != nullptr, "op ", operator_def.type(),
-                 ": Encountered a non-existing input tensor: ", input_str);
-      inputs_.push_back(tensor);
-    }
-
-    for (int i = 0; i < operator_def.output_size(); ++i) {
-      const std::string output_str = operator_def.output(i);
-      if (ws->HasTensor(output_str)) {
-        outputs_.push_back(ws->GetTensor(output_str));
-      } else {
-        MACE_CHECK(
-          operator_def.output_type_size() == 0
-          || operator_def.output_size() == operator_def.output_type_size(),
-          "operator output size != operator output type size",
-          operator_def.output_size(),
-          operator_def.output_type_size());
-        DataType output_type;
-        if (i < operator_def.output_type_size()) {
-          output_type = operator_def.output_type(i);
-        } else {
-          output_type = DataTypeToEnum<T>::v();
-        }
-        outputs_.push_back(MACE_CHECK_NOTNULL(ws->CreateTensor(
-          output_str, GetDeviceAllocator(D), output_type)));
-      }
-    }
-  }
-  MaceStatus Run(StatsFuture *future) override = 0;
-  ~Operator() noexcept override {}
+  MACE_DISABLE_COPY_AND_ASSIGN(Operation);
 };
 
 // MACE_OP_INPUT_TAGS and MACE_OP_OUTPUT_TAGS are optional features to name the
@@ -139,54 +240,102 @@ class Operator : public OperatorBase {
 #define MACE_OP_OUTPUT_TAGS(first_input, ...) \
   enum _OutputTags { first_input = 0, __VA_ARGS__ }
 
-class OpKeyBuilder {
+
+struct OpRegistrationInfo {
  public:
-  explicit OpKeyBuilder(const char *op_name);
+  typedef std::function<std::unique_ptr<Operation>(OpConstructContext *)>
+      OpCreator;
+  typedef std::function<std::set<DeviceType>(OpConditionContext *)>
+      DevicePlacer;
+  typedef std::function<void(OpConditionContext *)> MemoryTypeSetter;
+  typedef std::function<std::vector<DataFormat>(OpConditionContext *)>
+      DataFormatSelector;
 
-  OpKeyBuilder &Device(DeviceType device);
+  OpRegistrationInfo();
 
-  OpKeyBuilder &TypeConstraint(const char *attr_name, const DataType allowed);
+  void AddDevice(DeviceType);
 
-  template <typename T>
-  OpKeyBuilder &TypeConstraint(const char *attr_name);
+  void Register(const std::string &key, OpCreator creator);
 
-  const std::string Build();
-
- private:
-  std::string op_name_;
-  DeviceType device_type_;
-  std::map<std::string, DataType> type_constraint_;
+  std::set<DeviceType> devices;
+  std::unordered_map<std::string, OpCreator> creators;
+  DevicePlacer device_placer;
+  MemoryTypeSetter memory_type_setter;
+  DataFormatSelector data_format_selector;
 };
 
-template <typename T>
-OpKeyBuilder &OpKeyBuilder::TypeConstraint(const char *attr_name) {
-  return this->TypeConstraint(attr_name, DataTypeToEnum<T>::value);
-}
-
-class OperatorRegistry {
+class OpConditionBuilder {
  public:
-  typedef Registry<std::string, OperatorBase, const OperatorDef &, Workspace *>
-      RegistryType;
-  OperatorRegistry();
-  ~OperatorRegistry() = default;
-  RegistryType *registry() { return &registry_; }
-  std::unique_ptr<OperatorBase> CreateOperator(const OperatorDef &operator_def,
-                                               Workspace *ws,
-                                               DeviceType type,
-                                               const NetMode mode) const;
+  explicit OpConditionBuilder(const std::string &type);
+
+  const std::string type() const;
+
+  OpConditionBuilder &SetDevicePlacerFunc(
+      OpRegistrationInfo::DevicePlacer placer);
+
+  // If you set input memory type for specified Op,
+  // you must call OpConditionContext::set_output_mem_type
+  OpConditionBuilder &SetInputMemoryTypeSetter(
+      OpRegistrationInfo::MemoryTypeSetter setter);
+
+  OpConditionBuilder &SetInputsDataFormatSelector(
+      OpRegistrationInfo::DataFormatSelector selector);
+
+  void Finalize(OpRegistrationInfo *info) const;
 
  private:
-  RegistryType registry_;
-  MACE_DISABLE_COPY_AND_ASSIGN(OperatorRegistry);
+  std::string type_;
+  OpRegistrationInfo::DevicePlacer placer_;
+  OpRegistrationInfo::MemoryTypeSetter memory_type_setter_;
+  OpRegistrationInfo::DataFormatSelector data_format_selector_;
 };
 
-MACE_DECLARE_REGISTRY(OpRegistry,
-                      OperatorBase,
-                      const OperatorDef &,
-                      Workspace *);
 
-#define MACE_REGISTER_OPERATOR(op_registry, name, ...) \
-  MACE_REGISTER_CLASS(OpRegistry, op_registry->registry(), name, __VA_ARGS__)
+class OpRegistryBase {
+ public:
+  OpRegistryBase() = default;
+  virtual ~OpRegistryBase() = default;
+  MaceStatus Register(const std::string &op_type,
+                      const DeviceType device_type,
+                      const DataType dt,
+                      OpRegistrationInfo::OpCreator creator);
+
+  MaceStatus Register(const OpConditionBuilder &builder);
+
+  const std::set<DeviceType> AvailableDevices(
+      const std::string &op_type, OpConditionContext *context) const;
+
+  void GetInOutMemoryTypes(
+      const std::string &op_type, OpConditionContext *context) const;
+
+  const std::vector<DataFormat> InputsDataFormat(
+      const std::string &op_type, OpConditionContext *context) const;
+
+  std::unique_ptr<Operation> CreateOperation(
+      OpConstructContext *context,
+      DeviceType device_type) const;
+
+  template <class DerivedType>
+  static std::unique_ptr<Operation> DefaultCreator(
+      OpConstructContext *context) {
+    return std::unique_ptr<Operation>(new DerivedType(context));
+  }
+
+ private:
+  std::unordered_map<
+      std::string,
+      std::unique_ptr<OpRegistrationInfo>> registry_;
+  MACE_DISABLE_COPY_AND_ASSIGN(OpRegistryBase);
+};
+
+#define MACE_REGISTER_OP(op_registry, op_type, class_name, device, dt) \
+  op_registry->Register(op_type,                                       \
+                        device,                                        \
+                        DataTypeToEnum<dt>::value,                     \
+                        OpRegistryBase::DefaultCreator<class_name<device, dt>>)
+
+#define MACE_REGISTER_OP_CONDITION(op_registry, builder) \
+  op_registry->Register(builder)
 
 }  // namespace mace
 

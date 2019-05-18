@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,19 +13,172 @@
 // limitations under the License.
 
 #include <sstream>
+#include <map>
 #include <memory>
-#include <string>
 #include <vector>
 
 #include "mace/core/operator.h"
 
 namespace mace {
+OpConditionContext::OpConditionContext(
+    const Workspace *ws,
+    OpConditionContext::TensorShapeMap *info)
+    : operator_def_(nullptr),
+      ws_(ws),
+      device_(nullptr),
+      tensor_shape_info_(info) {}
 
-OperatorBase::OperatorBase(const OperatorDef &operator_def, Workspace *ws)
-    : operator_ws_(ws),
-      operator_def_(std::make_shared<OperatorDef>(operator_def)) {}
+void OpConditionContext::set_operator_def(
+    const OperatorDef *operator_def) {
+  operator_def_ = operator_def;
+  input_data_types_.clear();
+}
 
-OpKeyBuilder::OpKeyBuilder(const char *op_name) : op_name_(op_name) {}
+void OpConditionContext::SetInputInfo(size_t idx,
+                                      MemoryType mem_type,
+                                      DataType dt) {
+  if (input_mem_types_.empty()) {
+    // the default inputs' memory types are same as output memory type.
+    input_mem_types_.resize(operator_def_->input_size(), output_mem_type_);
+  }
+  if (input_data_types_.empty()) {
+    // the default inputs' data types are same as operation's data type.
+    DataType op_dt = static_cast<DataType>(
+        ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
+            *operator_def_, "T", static_cast<int>(DataType::DT_FLOAT)));
+    input_data_types_.resize(operator_def_->input_size(), op_dt);
+  }
+  MACE_CHECK(idx < input_mem_types_.size() && idx < input_data_types_.size());
+  input_mem_types_[idx] = mem_type;
+  input_data_types_[idx] = dt;
+}
+
+void OpConditionContext::set_output_mem_type(MemoryType type) {
+  MACE_CHECK(operator_def_ != nullptr);
+  output_mem_type_ = type;
+  input_mem_types_.clear();
+}
+
+MemoryType OpConditionContext::GetInputMemType(size_t idx) const {
+  if (input_mem_types_.empty()) {
+    return output_mem_type_;
+  }
+  MACE_CHECK(idx < input_mem_types_.size(),
+             idx, " < ", input_mem_types_.size());
+  return input_mem_types_[idx];
+}
+
+DataType OpConditionContext::GetInputDataType(size_t idx) const {
+  if (input_data_types_.empty()) {
+    // the default inputs' data types are same as operation's data type.
+    return static_cast<DataType>(
+        ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
+            *operator_def_, "T", static_cast<int>(DataType::DT_FLOAT)));
+  }
+  MACE_CHECK(idx < input_data_types_.size());
+  return input_data_types_[idx];
+}
+
+#ifdef MACE_ENABLE_OPENCL
+void OpConditionContext::SetInputOpenCLBufferType(
+    size_t idx, OpenCLBufferType buffer_type) {
+  if (input_opencl_buffer_types_.empty()) {
+    // the default inputs' memory types are same as output memory type.
+    input_opencl_buffer_types_.resize(operator_def_->input_size(),
+                                      OpenCLBufferType::IN_OUT_CHANNEL);
+  }
+  MACE_CHECK(idx < input_opencl_buffer_types_.size());
+  input_opencl_buffer_types_[idx] = buffer_type;
+}
+OpenCLBufferType OpConditionContext::GetInputOpenCLBufferType(
+    size_t idx) const {
+  if (input_opencl_buffer_types_.empty()) {
+    return OpenCLBufferType::IN_OUT_CHANNEL;
+  }
+  MACE_CHECK(idx < input_opencl_buffer_types_.size());
+  return input_opencl_buffer_types_[idx];
+}
+#endif  // MACE_ENABLE_OPENCL
+
+OpConstructContext::OpConstructContext(Workspace *ws)
+    : operator_def_(nullptr),
+      ws_(ws),
+      device_(nullptr) {}
+
+void OpConstructContext::set_operator_def(
+    std::shared_ptr<OperatorDef> operator_def) {
+  operator_def_ = operator_def;
+}
+
+OpInitContext::OpInitContext(Workspace *ws, Device *device)
+    : ws_(ws), device_(device) {}
+
+Operation::Operation(OpConstructContext *context)
+    : operator_def_(context->operator_def())
+{}
+
+MaceStatus Operation::Init(OpInitContext *context) {
+  Workspace *ws = context->workspace();
+  for (const std::string &input_str : operator_def_->input()) {
+    const Tensor *tensor = ws->GetTensor(input_str);
+    MACE_CHECK(tensor != nullptr, "op ", operator_def_->type(),
+               ": Encountered a non-existing input tensor: ", input_str);
+    inputs_.push_back(tensor);
+  }
+  for (int i = 0; i < operator_def_->output_size(); ++i) {
+    const std::string output_str = operator_def_->output(i);
+    if (ws->HasTensor(output_str)) {
+      outputs_.push_back(ws->GetTensor(output_str));
+    } else {
+      MACE_CHECK(
+          operator_def_->output_type_size() == 0 ||
+              operator_def_->output_size() == operator_def_->output_type_size(),
+          "operator output size != operator output type size",
+          operator_def_->output_size(),
+          operator_def_->output_type_size());
+      DataType output_type;
+      if (i < operator_def_->output_type_size()) {
+        output_type = operator_def_->output_type(i);
+      } else {
+        output_type = static_cast<DataType>(
+            ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
+            *operator_def_, "T", static_cast<int>(DT_FLOAT)));
+      }
+      outputs_.push_back(MACE_CHECK_NOTNULL(ws->CreateTensor(
+          output_str, context->device()->allocator(), output_type)));
+    }
+    if (i < operator_def_->output_shape_size()) {
+      std::vector<index_t>
+          shape_configured(operator_def_->output_shape(i).dims_size());
+      for (size_t dim = 0; dim < shape_configured.size(); ++dim) {
+        shape_configured[dim] = operator_def_->output_shape(i).dims(dim);
+      }
+      ws->GetTensor(output_str)->SetShapeConfigured(shape_configured);
+    }
+  }
+  return MaceStatus::MACE_SUCCESS;
+}
+
+// op registry
+namespace {
+class OpKeyBuilder {
+ public:
+  explicit OpKeyBuilder(const std::string &op_name);
+
+  OpKeyBuilder &Device(DeviceType device);
+
+  OpKeyBuilder &TypeConstraint(const char *attr_name,
+                               DataType allowed);
+
+  const std::string Build();
+
+ private:
+  std::string op_name_;
+  DeviceType device_type_;
+  std::map<std::string, DataType> type_constraint_;
+};
+
+OpKeyBuilder::OpKeyBuilder(const std::string &op_name) : op_name_(op_name) {}
 
 OpKeyBuilder &OpKeyBuilder::Device(DeviceType device) {
   device_type_ = device;
@@ -33,7 +186,7 @@ OpKeyBuilder &OpKeyBuilder::Device(DeviceType device) {
 }
 
 OpKeyBuilder &OpKeyBuilder::TypeConstraint(const char *attr_name,
-                                           const DataType allowed) {
+                                           DataType allowed) {
   type_constraint_[attr_name] = allowed;
   return *this;
 }
@@ -49,125 +202,168 @@ const std::string OpKeyBuilder::Build() {
 
   return ss.str();
 }
+}  // namespace
 
-std::unique_ptr<OperatorBase> OperatorRegistry::CreateOperator(
-    const OperatorDef &operator_def,
-    Workspace *ws,
-    DeviceType type,
-    const NetMode mode) const {
-  const int dtype = ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
-      operator_def, "T", static_cast<int>(DT_FLOAT));
-  const int op_mode_i = ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
-      operator_def, "mode", static_cast<int>(NetMode::NORMAL));
-  const NetMode op_mode = static_cast<NetMode>(op_mode_i);
-  if (op_mode == mode) {
-    return registry_.Create(
-        OpKeyBuilder(operator_def.type().data())
-            .Device(type)
-            .TypeConstraint("T", static_cast<DataType>(dtype))
-            .Build(),
-        operator_def, ws);
-  } else {
-    return nullptr;
-  }
+OpRegistrationInfo::OpRegistrationInfo() {
+  // default device type placer
+  device_placer = [this](OpConditionContext *context) -> std::set<DeviceType> {
+    MACE_UNUSED(context);
+    return this->devices;
+  };
+
+  // default input and output memory type setter
+  memory_type_setter = [](OpConditionContext *context) -> void {
+    if (context->device()->device_type() == DeviceType::GPU) {
+#ifdef MACE_ENABLE_OPENCL
+      if (context->device()->gpu_runtime()->UseImageMemory()) {
+        context->set_output_mem_type(MemoryType::GPU_IMAGE);
+      } else {
+        context->set_output_mem_type(MemoryType::GPU_BUFFER);
+      }
+#endif  // MACE_ENABLE_OPENCL
+    } else {
+      context->set_output_mem_type(MemoryType::CPU_BUFFER);
+    }
+  };
+
+  data_format_selector = [](OpConditionContext *context)
+      -> std::vector<DataFormat> {
+    DataFormat op_data_format =
+        static_cast<DataFormat>(
+            ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
+                *context->operator_def(), "data_format",
+                static_cast<int>(DataFormat::NONE)));
+    return std::vector<DataFormat>(context->operator_def()->input_size(),
+                                   op_data_format);
+  };
 }
 
-namespace ops {
-// Keep in lexicographical order
-extern void Register_Activation(OperatorRegistry *op_registry);
-extern void Register_AddN(OperatorRegistry *op_registry);
-extern void Register_ArgMax(OperatorRegistry *op_registry);
-extern void Register_BatchNorm(OperatorRegistry *op_registry);
-extern void Register_BatchToSpaceND(OperatorRegistry *op_registry);
-extern void Register_BiasAdd(OperatorRegistry *op_registry);
-extern void Register_Cast(OperatorRegistry *op_registry);
-extern void Register_ChannelShuffle(OperatorRegistry *op_registry);
-extern void Register_Concat(OperatorRegistry *op_registry);
-extern void Register_Conv2D(OperatorRegistry *op_registry);
-extern void Register_Deconv2D(OperatorRegistry *op_registry);
-extern void Register_DepthToSpace(OperatorRegistry *op_registry);
-extern void Register_DepthwiseConv2d(OperatorRegistry *op_registry);
-extern void Register_Dequantize(OperatorRegistry *op_registry);
-extern void Register_Eltwise(OperatorRegistry *op_registry);
-extern void Register_FoldedBatchNorm(OperatorRegistry *op_registry);
-extern void Register_FullyConnected(OperatorRegistry *op_registry);
-extern void Register_Gather(OperatorRegistry *op_registry);
-extern void Register_Identity(OperatorRegistry *op_registry);
-extern void Register_LocalResponseNorm(OperatorRegistry *op_registry);
-extern void Register_MatMul(OperatorRegistry *op_registry);
-extern void Register_Pad(OperatorRegistry *op_registry);
-extern void Register_Pooling(OperatorRegistry *op_registry);
-extern void Register_Proposal(OperatorRegistry *op_registry);
-extern void Register_Quantize(OperatorRegistry *op_registry);
-extern void Register_ReduceMean(OperatorRegistry *op_registry);
-extern void Register_Requantize(OperatorRegistry *op_registry);
-extern void Register_Reshape(OperatorRegistry *op_registry);
-extern void Register_ResizeBilinear(OperatorRegistry *op_registry);
-extern void Register_Shape(OperatorRegistry *op_registry);
-extern void Register_Slice(OperatorRegistry *op_registry);
-extern void Register_Softmax(OperatorRegistry *op_registry);
-extern void Register_Stack(OperatorRegistry *op_registry);
-extern void Register_StridedSlice(OperatorRegistry *op_registry);
-extern void Register_SpaceToBatchND(OperatorRegistry *op_registry);
-extern void Register_SpaceToDepth(OperatorRegistry *op_registry);
-extern void Register_Squeeze(OperatorRegistry *op_registry);
-extern void Register_Transpose(OperatorRegistry *op_registry);
-extern void Register_WinogradInverseTransform(OperatorRegistry *op_registry);
-extern void Register_WinogradTransform(OperatorRegistry *op_registry);
+void OpRegistrationInfo::AddDevice(DeviceType device) {
+  devices.insert(device);
+}
 
-#ifdef MACE_ENABLE_OPENCL
-extern void Register_BufferToImage(OperatorRegistry *op_registry);
-extern void Register_ImageToBuffer(OperatorRegistry *op_registry);
-#endif  // MACE_ENABLE_OPENCL
-}  // namespace ops
+void OpRegistrationInfo::Register(const std::string &key, OpCreator creator) {
+  VLOG(3) << "Registering: " << key;
+  MACE_CHECK(creators.count(key) == 0, "Key already registered: ", key);
+  creators[key] = creator;
+}
 
-OperatorRegistry::OperatorRegistry() {
-  // Keep in lexicographical order
-  ops::Register_Activation(this);
-  ops::Register_AddN(this);
-  ops::Register_ArgMax(this);
-  ops::Register_BatchNorm(this);
-  ops::Register_BatchToSpaceND(this);
-  ops::Register_BiasAdd(this);
-  ops::Register_Cast(this);
-  ops::Register_ChannelShuffle(this);
-  ops::Register_Concat(this);
-  ops::Register_Conv2D(this);
-  ops::Register_Deconv2D(this);
-  ops::Register_DepthToSpace(this);
-  ops::Register_DepthwiseConv2d(this);
-  ops::Register_Dequantize(this);
-  ops::Register_Eltwise(this);
-  ops::Register_FoldedBatchNorm(this);
-  ops::Register_FullyConnected(this);
-  ops::Register_Gather(this);
-  ops::Register_Identity(this);
-  ops::Register_LocalResponseNorm(this);
-  ops::Register_MatMul(this);
-  ops::Register_Pad(this);
-  ops::Register_Pooling(this);
-  ops::Register_Proposal(this);
-  ops::Register_Quantize(this);
-  ops::Register_ReduceMean(this);
-  ops::Register_Requantize(this);
-  ops::Register_Reshape(this);
-  ops::Register_ResizeBilinear(this);
-  ops::Register_Shape(this);
-  ops::Register_Slice(this);
-  ops::Register_Softmax(this);
-  ops::Register_Stack(this);
-  ops::Register_StridedSlice(this);
-  ops::Register_SpaceToBatchND(this);
-  ops::Register_SpaceToDepth(this);
-  ops::Register_Squeeze(this);
-  ops::Register_Transpose(this);
-  ops::Register_WinogradInverseTransform(this);
-  ops::Register_WinogradTransform(this);
+MaceStatus OpRegistryBase::Register(
+    const std::string &op_type,
+    const DeviceType device_type,
+    const DataType dt,
+    OpRegistrationInfo::OpCreator creator) {
+  if (registry_.count(op_type) == 0) {
+    registry_[op_type] = std::unique_ptr<OpRegistrationInfo>(
+        new OpRegistrationInfo);
+  }
+  registry_[op_type]->AddDevice(device_type);
 
-#ifdef MACE_ENABLE_OPENCL
-  ops::Register_BufferToImage(this);
-  ops::Register_ImageToBuffer(this);
-#endif  // MACE_ENABLE_OPENCL
+  std::string op_key = OpKeyBuilder(op_type)
+      .Device(device_type)
+      .TypeConstraint("T", dt)
+      .Build();
+  registry_.at(op_type)->Register(op_key, creator);
+  return MaceStatus::MACE_SUCCESS;
+}
+
+MaceStatus OpRegistryBase::Register(
+    const OpConditionBuilder &builder) {
+  std::string op_type = builder.type();
+  if (registry_.count(op_type) == 0) {
+    registry_[op_type] = std::unique_ptr<OpRegistrationInfo>(
+        new OpRegistrationInfo);
+  }
+  builder.Finalize(registry_[op_type].get());
+  return MaceStatus::MACE_SUCCESS;
+}
+
+const std::set<DeviceType> OpRegistryBase::AvailableDevices(
+    const std::string &op_type, OpConditionContext *context) const {
+  MACE_CHECK(registry_.count(op_type) != 0,
+             op_type, " operation is not registered.");
+
+  return registry_.at(op_type)->device_placer(context);
+}
+
+void OpRegistryBase::GetInOutMemoryTypes(
+    const std::string &op_type,
+    OpConditionContext *context) const {
+  MACE_CHECK(registry_.count(op_type) != 0,
+             op_type, " operation is not registered.");
+  return registry_.at(op_type)->memory_type_setter(context);
+}
+
+const std::vector<DataFormat> OpRegistryBase::InputsDataFormat(
+    const std::string &op_type,
+    OpConditionContext *context) const {
+  MACE_CHECK(registry_.count(op_type) != 0,
+             op_type, " operation is not registered.");
+  return registry_.at(op_type)->data_format_selector(context);
+}
+
+std::unique_ptr<Operation> OpRegistryBase::CreateOperation(
+    OpConstructContext *context,
+    DeviceType device_type) const {
+  auto operator_def = context->operator_def();
+  DataType dtype = static_cast<DataType>(
+      ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
+          *operator_def, "T", static_cast<int>(DT_FLOAT)));
+  VLOG(1) << "Creating operator " << operator_def->name() << "("
+          << operator_def->type() << "<" << dtype << ">" << ") on "
+          << device_type;
+  const std::string op_type = context->operator_def()->type();
+  MACE_CHECK(registry_.count(op_type) != 0,
+             op_type, " operation is not registered.");
+
+  std::string key = OpKeyBuilder(op_type)
+      .Device(device_type)
+      .TypeConstraint("T", dtype)
+      .Build();
+  if (registry_.at(op_type)->creators.count(key) == 0) {
+    LOG(FATAL) << "Key not registered: " << key;
+  }
+  return registry_.at(op_type)->creators.at(key)(context);
+}
+
+OpConditionBuilder::OpConditionBuilder(const std::string &type)
+  : type_(type) {}
+
+const std::string OpConditionBuilder::type() const {
+  return type_;
+}
+
+OpConditionBuilder &OpConditionBuilder::SetDevicePlacerFunc(
+    OpRegistrationInfo::DevicePlacer placer) {
+  placer_ = placer;
+  return *this;
+}
+
+OpConditionBuilder& OpConditionBuilder::SetInputMemoryTypeSetter(
+    OpRegistrationInfo::MemoryTypeSetter setter) {
+  memory_type_setter_ = setter;
+  return *this;
+}
+
+OpConditionBuilder& OpConditionBuilder::SetInputsDataFormatSelector(
+    OpRegistrationInfo::DataFormatSelector selector) {
+  data_format_selector_ = selector;
+  return *this;
+}
+
+void OpConditionBuilder::Finalize(OpRegistrationInfo *info) const {
+  if (info != nullptr) {
+    if (placer_) {
+      info->device_placer = placer_;
+    }
+    if (memory_type_setter_) {
+      info->memory_type_setter = memory_type_setter_;
+    }
+
+    if (data_format_selector_) {
+      info->data_format_selector = data_format_selector_;
+    }
+  }
 }
 
 }  // namespace mace

@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,64 +18,51 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <sstream>
 
 #include "mace/core/operator.h"
-#include "mace/public/mace.h"
 
 namespace mace {
 
 class RunMetadata;
-class OperatorBase;
 class Workspace;
+class MemoryOptimizer;
 
 class NetBase {
  public:
-  NetBase(const std::shared_ptr<const OperatorRegistry> op_registry,
-          const std::shared_ptr<const NetDef> net_def,
-          Workspace *ws,
-          DeviceType type);
-  virtual ~NetBase() noexcept {}
+  NetBase() noexcept = default;
+  virtual ~NetBase() = default;
+
+  virtual MaceStatus Init() = 0;
 
   virtual MaceStatus Run(RunMetadata *run_metadata = nullptr) = 0;
 
-  const std::string &Name() const { return name_; }
-
  protected:
-  std::string name_;
-  const std::shared_ptr<const OperatorRegistry> op_registry_;
-
   MACE_DISABLE_COPY_AND_ASSIGN(NetBase);
 };
 
 class SerialNet : public NetBase {
  public:
-  SerialNet(const std::shared_ptr<const OperatorRegistry> op_registry,
-            const std::shared_ptr<const NetDef> net_def,
+  SerialNet(const OpRegistryBase *op_registry,
+            const NetDef *net_def,
             Workspace *ws,
-            DeviceType type,
-            const NetMode mode = NetMode::NORMAL);
+            Device *target_device,
+            MemoryOptimizer * mem_optimizer);
+
+  MaceStatus Init() override;
 
   MaceStatus Run(RunMetadata *run_metadata = nullptr) override;
 
  protected:
-  std::vector<std::unique_ptr<OperatorBase> > operators_;
-  DeviceType device_type_;
+  Workspace *ws_;
+  Device *target_device_;
+  // CPU is base device.
+  std::unique_ptr<Device> cpu_device_;
+  std::vector<std::unique_ptr<Operation> > operators_;
 
   MACE_DISABLE_COPY_AND_ASSIGN(SerialNet);
 };
-
-std::unique_ptr<NetBase> CreateNet(
-    const std::shared_ptr<const OperatorRegistry> op_registry,
-    const NetDef &net_def,
-    Workspace *ws,
-    DeviceType type,
-    const NetMode mode = NetMode::NORMAL);
-std::unique_ptr<NetBase> CreateNet(
-    const std::shared_ptr<const OperatorRegistry> op_registry,
-    const std::shared_ptr<const NetDef> net_def,
-    Workspace *ws,
-    DeviceType type,
-    const NetMode mode = NetMode::NORMAL);
 
 }  // namespace mace
 

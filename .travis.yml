@@ -1,0 +1,170 @@
+language: cpp
+
+before_install:
+  - echo "Start to test on $TRAVIS_OS_NAME";
+  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then export PIP=pip2; else export PIP=pip; fi
+  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then export OS=darwin; else export OS=linux; fi
+  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then export PYTHONPATH="/usr/local/lib/python2.7/site-packages:$PYTHONPATH"; fi
+  - sudo $PIP install pycodestyle
+  - export BAZEL_VERSION=0.13.1
+  - wget https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-installer-$OS-x86_64.sh
+  - chmod +x bazel-*.sh
+  - sudo ./bazel-$BAZEL_VERSION-installer-$OS-x86_64.sh
+  - rm -f bazel-$BAZEL_VERSION-installer-$OS-x86_64.sh
+  - pushd /opt/
+  - sudo wget -q https://dl.google.com/android/repository/android-ndk-r15c-$OS-x86_64.zip
+  - sudo unzip -q android-ndk-r15c-$OS-x86_64.zip
+  - sudo rm -f android-ndk-r15c-$OS-x86_64.zip
+  - export ANDROID_NDK_VERSION=r15c
+  - export ANDROID_NDK=/opt/android-ndk-${ANDROID_NDK_VERSION}
+  - export ANDROID_NDK_HOME=${ANDROID_NDK}
+  - export PATH=${PATH}:${ANDROID_NDK_HOME}
+  - popd
+  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then brew update; brew cask install android-platform-tools; fi
+  - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then sudo apt-get update; sudo apt-get install -y --no-install-recommends android-tools-adb; fi
+  - sudo $PIP install setuptools
+  - sudo $PIP install -I "tensorflow==1.8.0" "numpy==1.14.2" "sh==1.12.14" "pycodestyle==2.4.0" "pyyaml==3.12" "jinja2==2.10" "filelock==3.0.0" "scipy==1.0.0"
+
+jobs:
+  include:
+    - stage: Check Code Style
+      script:
+        - echo 'Check Code Style'
+        - curl -o cpplint.py https://raw.githubusercontent.com/google/styleguide/gh-pages/cpplint/cpplint.py && python cpplint.py --linelength=80 --counting=detailed $(find mace -name "*.h" -or -name "*.cc") && rm -f cpplint.py || exit 1;
+        - pycodestyle $(find . -name "*.py") || exit 1;
+      env: TYPE=Check-Code-Stype
+      os: linux
+      dist: xenial
+      sudo: required
+    - stage: Check Code Style
+      script:
+        - echo 'Check Code Style'
+        - curl -o cpplint.py https://raw.githubusercontent.com/google/styleguide/gh-pages/cpplint/cpplint.py && python cpplint.py --linelength=80 --counting=detailed $(find mace -name "*.h" -or -name "*.cc") && rm -f cpplint.py || exit 1;
+        - pycodestyle $(find . -name "*.py") || exit 1;
+      env: TYPE=Check-Code-Stype
+      os: osx
+      osx_image: xcode7.2
+    - stage: Unit Test
+      script:
+        - echo "Ops Test"
+        - python tools/bazel_adb_run.py --target="//mace/ops:ops_test" --run_target=False --target_abis=armeabi-v7a,arm64-v8a || exit 1;
+      env: TYPE=Ops-Test
+      os: linux
+      dist: xenial
+      sudo: required
+    - stage: Unit Test
+      script:
+        - echo "Ops Test"
+        - python tools/bazel_adb_run.py --target="//mace/ops:ops_test" --run_target=False --target_abis=armeabi-v7a,arm64-v8a || exit 1;
+      env: TYPE=Ops-Test
+      os: osx
+      osx_image: xcode7.2
+    - stage: Unit Test
+      script:
+        - echo "Ops Test On Darwin"
+        - python tools/bazel_adb_run.py --target="//mace/ops:ops_test" --run_target=False --enable_openmp=false --target_abis=host || exit 1;
+        - bazel build "//mace/ops:ops_test" --config=ios --config=optimization_darwin --define openmp=false --define quantize=true --define neon=true --config symbol_hidden || exit 1;
+      env: TYPE=Ops-Test
+      os: osx
+      osx_image: xcode7.2
+    - stage: Unit Test
+      script:
+        - echo "Ops Test Without NEON"
+        - python tools/bazel_adb_run.py --target="//mace/ops:ops_test" --run_target=False --target_abis=armeabi-v7a,arm64-v8a --enable_neon=false || exit 1
+      env: TYPE=Ops-Test-Without-NEON
+      os: linux
+      dist: xenial
+      sudo: required
+    - stage: Unit Test
+      script:
+        - python tools/bazel_adb_run.py --target="//mace/ops:ops_benchmark" --run_target=False --target_abis=armeabi-v7a,arm64-v8a || exit 1;
+      env: TYPE=Ops-Benchmark
+      os: linux
+      dist: xenial
+      sudo: required
+    - stage: Unit Test
+      script:
+        - python tools/bazel_adb_run.py --target="//mace/ops:ops_benchmark" --run_target=False --target_abis=armeabi-v7a,arm64-v8a || exit 1;
+      env: TYPE=Ops-Benchmark
+      os: osx
+      osx_image: xcode7.2
+    - stage: Unit Test
+      script:
+        - python tools/bazel_adb_run.py --target="//mace/ops:ops_benchmark" --run_target=False --enable_openmp=false --target_abis=host || exit 1;
+        - bazel build "//mace/ops:ops_benchmark" --config=ios --config=optimization_darwin --define openmp=false --define quantize=true --define neon=true --config symbol_hidden || exit 1;
+      env: TYPE=Ops-Benchmark
+      os: osx
+      osx_image: xcode7.2
+    - stage: Unit Test
+      script:
+        - DYNAMIC_LIB_PATH="bazel-bin/mace/libmace/libmace.so"
+        - bazel build -s --config android --config optimization mace/libmace:libmace_dynamic --define neon=true --define openmp=true --define opencl=false --define quantize=false --cpu=armeabi-v7a
+        - CURRENT_LIBMACE_SO_SIZE=`ls -l $DYNAMIC_LIB_PATH --block-size=K -s | cut -f 1 -d "K"`
+        - TARGET_MACE_WORK_DIR=`mktemp -d`
+        - pushd $TARGET_MACE_WORK_DIR
+        - GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" git clone https://github.com/XiaoMi/mace.git
+        - pushd mace
+        - bazel build -s --config android --config optimization mace/libmace:libmace_dynamic --define neon=true --define openmp=true --define opencl=false --define quantize=false --cpu=armeabi-v7a
+        - TARGET_LIBMACE_SO_SIZE=`ls -l $DYNAMIC_LIB_PATH --block-size=K -s | cut -f 1 -d "K"`
+        - popd
+        - popd
+        - rm -rf $TARGET_MACE_WORK_DIR
+        - echo "The libmace.so size grows from $TARGET_LIBMACE_SO_SIZE(KB) to $CURRENT_LIBMACE_SO_SIZE(KB)"
+        - if [ $TARGET_LIBMACE_SO_SIZE -lt `expr \( $CURRENT_LIBMACE_SO_SIZE - $TARGET_LIBMACE_SO_SIZE \) \* 10` ]; then echo "The libmace.so size grows larger than 10%"; exit 1; fi
+      env: TYPE=Libs-Size-Check
+      os: linux
+      dist: xenial
+      sudo: required
+    - stage: Extra Test
+      script:
+        - bazel build mace/libmace:libmace_static --config optimization --define openmp=true || exit 1
+        - bazel build mace/libmace:libmace_dynamic --config optimization --define openmp=true || exit 1
+      env: TYPE=Build-Library
+      os: linux
+      dist: xenial
+      sudo: required
+    - stage: Extra Test
+      script:
+        - echo 'API Test'
+        - python tools/bazel_adb_run.py --target="//mace/test:mace_api_test" --run_target=False --target_abis=armeabi-v7a || exit 1
+        - python tools/bazel_adb_run.py --target="//mace/test:mace_api_mt_test" --run_target=False --target_abis=armeabi-v7a || exit 1
+        - echo 'Extra Test'
+        - python tools/bazel_adb_run.py --target="//mace/utils:utils_test" --run_target=False --target_abis=armeabi-v7a || exit 1
+      env: TYPE=Extra-Test-ARMEABI-v7a
+      os: linux
+      dist: xenial
+      sudo: required
+    - stage: Extra Test
+      script:
+        - echo 'API Test on ARM64'
+        - python tools/bazel_adb_run.py --target="//mace/test:mace_api_test" --run_target=False --target_abis=arm64-v8a || exit 1
+        - python tools/bazel_adb_run.py --target="//mace/test:mace_api_mt_test" --run_target=False --target_abis=arm64-v8a || exit 1
+        - echo 'Extra Test on ARM64'
+        - python tools/bazel_adb_run.py --target="//mace/utils:utils_test" --run_target=False --target_abis=arm64-v8a || exit 1
+      env: TYPE=Extra-Test-ARM64-v8a
+      os: linux
+      dist: xenial
+      sudo: required
+    - stage: Extra Test
+      script:
+        - bazel build "//mace/libmace:libmace_static" --config=darwin --config=optimization_darwin --define openmp=false --define quantize=true --config symbol_hidden || exit 1;
+        - bazel build "//mace/libmace:libmace_dynamic" --config=darwin --config=optimization_darwin --define openmp=false --define quantize=true --config symbol_hidden || exit 1;
+      env: TYPE=Build-Library
+      os: osx
+      osx_image: xcode7.2
+    - stage: Extra Test
+      script:
+        - bazel build "//mace/libmace:libmace_static" --config=ios --config=optimization_darwin --define openmp=false --define quantize=true --define neon=true --config symbol_hidden || exit 1;
+        - bazel build "//mace/libmace:libmace_dynamic" --config=ios --config=optimization_darwin --define openmp=false --define quantize=true --define neon=true --config symbol_hidden || exit 1;
+      env: TYPE=Build-Library
+      os: osx
+      osx_image: xcode7.2
+    - stage: Extra Test
+      script:
+        - echo 'API Test'
+        - python tools/bazel_adb_run.py --target="//mace/test:mace_api_test" --run_target=False --enable_openmp=false --target_abis=host || exit 1
+        - python tools/bazel_adb_run.py --target="//mace/test:mace_api_mt_test" --run_target=False --enable_openmp=false --target_abis=host || exit 1
+        - python tools/bazel_adb_run.py --target="//mace/utils:utils_test" --run_target=False --enable_openmp=false --target_abis=host || exit 1
+      env: TYPE=Extra-Test-darwin_x86_64
+      os: osx
+      osx_image: xcode7.2

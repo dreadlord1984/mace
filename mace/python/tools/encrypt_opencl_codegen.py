@@ -1,4 +1,4 @@
-# Copyright 2018 Xiaomi, Inc.  All rights reserved.
+# Copyright 2018 The MACE Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,11 +14,12 @@
 
 import argparse
 import os
+import shutil
 import sys
 
 import jinja2
 
-# python encrypt_opencl_codegen.py --cl_kernel_dir=./mace/kernels/opencl/cl/  \
+# python encrypt_opencl_codegen.py --cl_kernel_dir=./mace/ops/opencl/cl/  \
 #     --output_path=./mace/codegen/opencl_encrypt/opencl_encrypted_program.cc
 
 FLAGS = None
@@ -68,10 +69,25 @@ def encrypt_opencl_codegen(cl_kernel_dir, output_path):
             data_type='unsigned char',
             variable_name='kEncryptedProgramMap')
 
-    if os.path.isfile(output_path):
-        os.remove(output_path)
+    output_dir = os.path.dirname(output_path)
+    if os.path.exists(output_dir):
+        if os.path.isdir(output_dir):
+            try:
+                shutil.rmtree(output_dir)
+            except OSError:
+                raise RuntimeError(
+                    "Cannot delete directory %s due to permission "
+                    "error, inspect and remove manually" % output_dir)
+        else:
+            raise RuntimeError(
+                "Cannot delete non-directory %s, inspect ",
+                "and remove manually" % output_dir)
+    os.makedirs(output_dir)
+
     with open(output_path, "w") as w_file:
         w_file.write(cpp_cl_encrypted_kernel)
+
+    print('Generate OpenCL kernel done.')
 
 
 def parse_args():
@@ -80,7 +96,7 @@ def parse_args():
     parser.add_argument(
         "--cl_kernel_dir",
         type=str,
-        default="./mace/kernels/opencl/cl/",
+        default="./mace/ops/opencl/cl/",
         help="The cl kernels directory.")
     parser.add_argument(
         "--output_path",

@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,16 +21,25 @@
 #include <functional>
 
 #include "mace/core/allocator.h"
-#include "mace/core/macros.h"
 #include "mace/core/types.h"
+#include "mace/utils/logging.h"
+#include "mace/utils/macros.h"
 
 namespace mace {
+namespace core {
+enum BufferType {
+  BT_BUFFER,
+  BT_IMAGE,
+};
+}  // namespace core
 
 class BufferBase {
  public:
   BufferBase() : size_(0) {}
   explicit BufferBase(index_t size) : size_(size) {}
   virtual ~BufferBase() {}
+
+  virtual core::BufferType buffer_type() const = 0;
 
   virtual void *buffer() = 0;
 
@@ -62,6 +71,8 @@ class BufferBase {
   virtual void Clear() = 0;
 
   virtual void Clear(index_t size) = 0;
+
+  virtual const std::vector<size_t> shape() const = 0;
 
   virtual index_t offset() const { return 0; }
 
@@ -104,6 +115,10 @@ class Buffer : public BufferBase {
     if (is_data_owner_ && buf_ != nullptr) {
       allocator_->Delete(buf_);
     }
+  }
+
+  core::BufferType buffer_type() const {
+    return core::BufferType::BT_BUFFER;
   }
 
   void *buffer() {
@@ -207,6 +222,11 @@ class Buffer : public BufferBase {
     memset(reinterpret_cast<char*>(raw_mutable_data()), 0, size);
   }
 
+  const std::vector<size_t> shape() const {
+    MACE_NOT_IMPLEMENTED;
+    return {};
+  }
+
  protected:
   Allocator *allocator_;
   void *buf_;
@@ -218,9 +238,9 @@ class Buffer : public BufferBase {
 
 class Image : public BufferBase {
  public:
-  Image()
+  explicit Image(Allocator *allocator)
       : BufferBase(0),
-        allocator_(GetDeviceAllocator(GPU)),
+        allocator_(allocator),
         buf_(nullptr),
         mapped_buf_(nullptr) {}
 
@@ -231,6 +251,15 @@ class Image : public BufferBase {
     if (buf_ != nullptr) {
       allocator_->DeleteImage(buf_);
     }
+  }
+
+  inline DataType dtype() const {
+    MACE_CHECK_NOTNULL(buf_);
+    return data_type_;
+  }
+
+  core::BufferType buffer_type() const {
+    return core::BufferType::BT_IMAGE;
   }
 
   void *buffer() {
@@ -247,8 +276,6 @@ class Image : public BufferBase {
     MACE_CHECK_NOTNULL(mapped_buf_);
     return mapped_buf_;
   }
-
-  std::vector<size_t> image_shape() const { return shape_; }
 
   MaceStatus Allocate(index_t nbytes) {
     MACE_UNUSED(nbytes);
@@ -323,6 +350,10 @@ class Image : public BufferBase {
     MACE_NOT_IMPLEMENTED;
   }
 
+  const std::vector<size_t> shape() const {
+    return shape_;
+  }
+
  private:
   Allocator *allocator_;
   std::vector<size_t> shape_;
@@ -354,10 +385,14 @@ class BufferSlice : public BufferBase {
   BufferSlice(const BufferSlice &other)
       : BufferSlice(other.buffer_, other.offset_, other.size_) {}
 
-  ~BufferSlice() {
+  virtual ~BufferSlice() {
     if (buffer_ != nullptr && mapped_buf_ != nullptr) {
       UnMap();
     }
+  }
+
+  core::BufferType buffer_type() const {
+    return core::BufferType::BT_BUFFER;
   }
 
   void *buffer() {
@@ -400,16 +435,11 @@ class BufferSlice : public BufferBase {
   }
 
   void *Map(index_t offset, index_t length, std::vector<size_t> *pitch) const {
-    MACE_UNUSED(offset);
-    MACE_UNUSED(length);
-    MACE_UNUSED(pitch);
-    MACE_NOT_IMPLEMENTED;
-    return nullptr;
+    return buffer_->Map(offset_ + offset, length, pitch);
   }
 
   void UnMap(void *mapped_ptr) const {
-    MACE_UNUSED(mapped_ptr);
-    MACE_NOT_IMPLEMENTED;
+    buffer_->UnMap(mapped_ptr);
   }
 
   void Map(std::vector<size_t> *pitch) {
@@ -449,6 +479,11 @@ class BufferSlice : public BufferBase {
     memset(raw_mutable_data(), 0, size);
   }
 
+  const std::vector<size_t> shape() const {
+    MACE_NOT_IMPLEMENTED;
+    return {};
+  }
+
  private:
   BufferBase *buffer_;
   void *mapped_buf_;
@@ -467,8 +502,10 @@ class ScratchBuffer: public Buffer {
 
   virtual ~ScratchBuffer() {}
 
-  MaceStatus GrowSize(index_t size) {
-    if (size > size_) {
+  MaceStatus GrowSize(const index_t size) {
+    if (offset_ + size > size_) {
+      VLOG(1) << "Grow scratch size to: " << size;
+      MACE_CHECK(offset_ == 0, "scratch is being used, cannot grow size");
       return Resize(size);
     }
     return MaceStatus::MACE_SUCCESS;
@@ -487,8 +524,12 @@ class ScratchBuffer: public Buffer {
     return slice;
   }
 
-  void Rewind() {
-    offset_ = 0;
+  void Rewind(index_t offset = 0) {
+    offset_ = offset;
+  }
+
+  index_t offset() const {
+    return offset_;
   }
 
  private:

@@ -1,4 +1,4 @@
-# Copyright 2018 Xiaomi, Inc.  All rights reserved.
+# Copyright 2018 The MACE Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,19 +16,17 @@
 # python tools/bazel_adb_run.py \
 #     --target_abis=armeabi-v7a \
 #     --target_socs=sdm845
-#     --target=//mace/ops:ops_test
+#     --target=//test/ccunit:mace_cc_test
 #     --stdout_processor=stdout_processor
 
 import argparse
-import random
-import re
 import sys
 
 import sh_commands
 
+from common import *
 
-def stdout_processor(stdout, device_properties, abi):
-    pass
+from device import DeviceWrapper, DeviceManager
 
 
 def unittest_stdout_processor(stdout, device_properties, abi):
@@ -39,28 +37,12 @@ def unittest_stdout_processor(stdout, device_properties, abi):
             raise Exception("Command failed")
 
 
-def ops_benchmark_stdout_processor(stdout, device_properties, abi):
+def ops_benchmark_stdout_processor(stdout, dev, abi):
     stdout_lines = stdout.split("\n")
     metrics = {}
     for line in stdout_lines:
         if "Aborted" in line or "Segmentation fault" in line:
             raise Exception("Command failed")
-        line = line.strip()
-        parts = line.split()
-        if len(parts) == 5 and parts[0].startswith("BM_"):
-            metrics["%s.time_ms" % parts[0]] = str(float(parts[1]) / 1e6)
-            metrics["%s.input_mb_per_sec" % parts[0]] = parts[3]
-            metrics["%s.gmacc_per_sec" % parts[0]] = parts[4]
-
-    platform = device_properties["ro.board.platform"].replace(" ", "-")
-    model = device_properties["ro.product.model"].replace(" ", "-")
-    tags = {
-        "ro.board.platform": platform,
-        "ro.product.model": model,
-        "abi": abi
-    }
-    # sh_commands.falcon_push_metrics(server,
-    #    metrics, tags=tags, endpoint="mace_ops_benchmark")
 
 
 # TODO: after merge mace/python/tools and tools are merged,
@@ -99,7 +81,7 @@ def parse_args():
     parser.add_argument(
         "--stdout_processor",
         type=str,
-        default="stdout_processor",
+        default="unittest_stdout_processor",
         help="Stdout processing function, default: stdout_processor")
     parser.add_argument(
         "--enable_neon",
@@ -107,60 +89,76 @@ def parse_args():
         default=True,
         help="Whether to use neon optimization")
     parser.add_argument(
+        "--enable_openmp",
+        type=str2bool,
+        default=False,
+        help="Whether to use openmp")
+    parser.add_argument(
         '--address_sanitizer',
         action="store_true",
         help="Whether to enable AddressSanitizer")
+    parser.add_argument(
+        '--debug_mode',
+        action="store_true",
+        help="Reserve debug symbols.")
+    parser.add_argument(
+        "--simpleperf",
+        type=str2bool,
+        default=False,
+        help="Whether to use simpleperf stat")
+    parser.add_argument(
+        '--device_yml',
+        type=str,
+        default='',
+        help='embedded linux device config yml file')
+    parser.add_argument('--vlog_level', type=int, default=0, help='vlog level')
     return parser.parse_known_args()
 
 
 def main(unused_args):
-    target_socs = None
-    if FLAGS.target_socs != "all" and FLAGS.target_socs != "random":
-        target_socs = set(FLAGS.target_socs.split(','))
-    target_devices = sh_commands.get_target_socs_serialnos(target_socs)
-    if FLAGS.target_socs == "random":
-        unlocked_devices = \
-            [d for d in target_devices if not sh_commands.is_device_locked(d)]
-        if len(unlocked_devices) > 0:
-            target_devices = [random.choice(unlocked_devices)]
-        else:
-            target_devices = [random.choice(target_devices)]
-
     target = FLAGS.target
     host_bin_path, bin_name = sh_commands.bazel_target_to_bin(target)
     target_abis = FLAGS.target_abis.split(',')
 
-    # generate sources
-    sh_commands.gen_encrypted_opencl_source()
-    sh_commands.gen_mace_version()
-    sh_commands.gen_tuning_param_code([])
-
     for target_abi in target_abis:
-        sh_commands.bazel_build(target, abi=target_abi,
-                                enable_neon=FLAGS.enable_neon,
-                                address_sanitizer=FLAGS.address_sanitizer)
+        toolchain = infer_toolchain(target_abi)
+        sh_commands.bazel_build(
+            target,
+            abi=target_abi,
+            toolchain=toolchain,
+            enable_neon=FLAGS.enable_neon,
+            enable_openmp=FLAGS.enable_openmp,
+            address_sanitizer=FLAGS.address_sanitizer,
+            debug_mode=FLAGS.debug_mode)
         if FLAGS.run_target:
-            for serialno in target_devices:
-                if target_abi not in set(
-                        sh_commands.adb_supported_abis(serialno)):
+            target_devices = DeviceManager.list_devices(FLAGS.device_yml)
+            if FLAGS.target_socs != TargetSOCTag.all and\
+                    FLAGS.target_socs != TargetSOCTag.random:
+                target_socs = set(FLAGS.target_socs.split(','))
+                target_devices = \
+                    [dev for dev in target_devices
+                     if dev[YAMLKeyword.target_socs] in target_socs]
+            if FLAGS.target_socs == TargetSOCTag.random:
+                target_devices = sh_commands.choose_a_random_device(
+                    target_devices, target_abi)
+
+            for dev in target_devices:
+                if target_abi not in dev[YAMLKeyword.target_abis]:
                     print("Skip device %s which does not support ABI %s" %
-                          (serialno, target_abi))
+                          (dev, target_abi))
                     continue
-                stdouts = sh_commands.adb_run(
+                device_wrapper = DeviceWrapper(dev)
+                stdouts = device_wrapper.run(
                     target_abi,
-                    serialno,
                     host_bin_path,
                     bin_name,
                     args=FLAGS.args,
                     opencl_profiling=True,
-                    vlog_level=0,
-                    device_bin_path="/data/local/tmp/mace",
+                    vlog_level=FLAGS.vlog_level,
                     out_of_range_check=True,
-                    address_sanitizer=FLAGS.address_sanitizer)
-                device_properties = sh_commands.adb_getprop_by_serialno(
-                    serialno)
-                globals()[FLAGS.stdout_processor](stdouts, device_properties,
-                                                  target_abi)
+                    address_sanitizer=FLAGS.address_sanitizer,
+                    simpleperf=FLAGS.simpleperf)
+                globals()[FLAGS.stdout_processor](stdouts, dev, target_abi)
 
 
 if __name__ == "__main__":

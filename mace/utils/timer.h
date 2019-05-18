@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 #ifndef MACE_UTILS_TIMER_H_
 #define MACE_UTILS_TIMER_H_
 
-#include "mace/utils/env_time.h"
+#include "mace/port/env.h"
 #include "mace/utils/logging.h"
 
 namespace mace {

@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,19 +25,14 @@ namespace mace {
 namespace {{tag}} {
 
 
-const unsigned char *LoadModelData(const std::string &model_data_file);
+extern const unsigned char *LoadModelData();
 
-void UnloadModelData(const unsigned char *model_data);
+extern const std::shared_ptr<NetDef> CreateNet();
 
-const std::shared_ptr<NetDef> CreateNet();
-
-const std::string ModelName();
-
-const std::string ModelChecksum();
-
-const std::string ModelBuildTime();
-
-const std::string ModelBuildOptions();
+extern const std::string ModelName();
+extern const std::string ModelChecksum();
+extern const std::string ModelBuildTime();
+extern const std::string ModelBuildOptions();
 
 }  // namespace {{ tag }}
 }  // namespace mace

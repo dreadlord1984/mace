@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,19 +17,18 @@
 
 #include <cstdint>
 #include <string>
+#if defined(MACE_ENABLE_NEON) && defined(__ANDROID__)
+#include <arm_neon.h>
+#endif
 
 #include "mace/proto/mace.pb.h"
-#ifdef MACE_ENABLE_OPENCL
 #include "include/half.hpp"
-#endif
 
 namespace mace {
 
 typedef int64_t index_t;
 
-#ifdef MACE_ENABLE_OPENCL
 using half = half_float::half;
-#endif
 
 bool DataTypeCanUseMemcpy(DataType dt);
 
@@ -54,12 +53,19 @@ struct EnumToDataType;
     typedef DATA_TYPE Type;                                     \
   };
 
-#ifdef MACE_ENABLE_OPENCL
 MACE_MAPPING_DATA_TYPE_AND_ENUM(half, DT_HALF);
+#if defined(MACE_ENABLE_NEON) && defined(__ANDROID__)
+MACE_MAPPING_DATA_TYPE_AND_ENUM(float16_t, DT_FLOAT16);
 #endif
 MACE_MAPPING_DATA_TYPE_AND_ENUM(float, DT_FLOAT);
 MACE_MAPPING_DATA_TYPE_AND_ENUM(uint8_t, DT_UINT8);
 MACE_MAPPING_DATA_TYPE_AND_ENUM(int32_t, DT_INT32);
+
+enum FrameworkType {
+  TENSORFLOW = 0,
+  CAFFE = 1,
+};
+
 }  // namespace mace
 
 #endif  // MACE_CORE_TYPES_H_

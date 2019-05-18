@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,38 +15,66 @@
 #ifndef MACE_OPS_ACTIVATION_H_
 #define MACE_OPS_ACTIVATION_H_
 
+#include <algorithm>
+#include <cmath>
 #include <string>
 
-#include "mace/core/operator.h"
-#include "mace/kernels/activation.h"
+#include "mace/core/types.h"
+#include "mace/core/op_context.h"
+#include "mace/ops/common/activation_type.h"
+#include "mace/utils/logging.h"
 
 namespace mace {
 namespace ops {
 
-template <DeviceType D, class T>
-class ActivationOp : public Operator<D, T> {
- public:
-  ActivationOp(const OperatorDef &operator_def, Workspace *ws)
-      : Operator<D, T>(operator_def, ws),
-        functor_(kernels::StringToActivationType(
-                     OperatorBase::GetOptionalArg<std::string>("activation",
-                                                               "NOOP")),
-                 static_cast<T>(
-                     OperatorBase::GetOptionalArg<float>("max_limit", 0.0f))) {}
-
-  MaceStatus Run(StatsFuture *future) override {
-    const Tensor *input_tensor = this->Input(0);
-    const Tensor *alpha_tensor =
-        this->InputSize() >= 2 ? this->Input(1) : nullptr;
-    Tensor *output_tensor = this->Output(0);
-    MACE_RETURN_IF_ERROR(output_tensor->ResizeLike(input_tensor));
-
-    return functor_(input_tensor, alpha_tensor, output_tensor, future);
+inline ActivationType StringToActivationType(const std::string type) {
+  if (type == "RELU") {
+    return ActivationType::RELU;
+  } else if (type == "RELUX") {
+    return ActivationType::RELUX;
+  } else if (type == "PRELU") {
+    return ActivationType::PRELU;
+  } else if (type == "TANH") {
+    return ActivationType::TANH;
+  } else if (type == "SIGMOID") {
+    return ActivationType::SIGMOID;
+  } else if (type == "NOOP") {
+    return ActivationType::NOOP;
+  } else if (type == "LEAKYRELU") {
+    return ActivationType::LEAKYRELU;
+  } else {
+    LOG(FATAL) << "Unknown activation type: " << type;
   }
+  return ActivationType::NOOP;
+}
 
- private:
-  kernels::ActivationFunctor<D, T> functor_;
-};
+template<typename T>
+void PReLUActivation(const OpContext *context,
+                     const T *input_ptr,
+                     const index_t outer_size,
+                     const index_t input_chan,
+                     const index_t inner_size,
+                     const T *alpha_ptr,
+                     T *output_ptr) {
+  utils::ThreadPool
+      &thread_pool = context->device()->cpu_runtime()->thread_pool();
+
+  thread_pool.Compute2D([=](index_t start0, index_t end0, index_t step0,
+                            index_t start1, index_t end1, index_t step1) {
+    for (index_t i = start0; i < end0; i += step0) {
+      for (index_t chan_idx = start1; chan_idx < end1; chan_idx += step1) {
+        for (index_t j = 0; j < inner_size; ++j) {
+          index_t idx = i * input_chan * inner_size + chan_idx * inner_size + j;
+          if (input_ptr[idx] < 0) {
+            output_ptr[idx] = input_ptr[idx] * alpha_ptr[chan_idx];
+          } else {
+            output_ptr[idx] = input_ptr[idx];
+          }
+        }
+      }
+    }
+  }, 0, outer_size, 1, 0, input_chan, 1);
+}
 
 }  // namespace ops
 }  // namespace mace

@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,21 +18,20 @@
 #include <vector>
 
 #include "mace/core/operator.h"
-#include "mace/kernels/conv_pool_2d_util.h"
+#include "mace/ops/common/conv_pool_2d_util.h"
 
 namespace mace {
 namespace ops {
 
-template <DeviceType D, class T>
-class ConvPool2dOpBase : public Operator<D, T> {
+class ConvPool2dOpBase : public Operation {
  public:
-  ConvPool2dOpBase(const OperatorDef &op_def, Workspace *ws)
-      : Operator<D, T>(op_def, ws),
-        strides_(OperatorBase::GetRepeatedArgs<int>("strides")),
-        padding_type_(static_cast<Padding>(OperatorBase::GetOptionalArg<int>(
+  explicit ConvPool2dOpBase(OpConstructContext *context)
+      : Operation(context),
+        strides_(Operation::GetRepeatedArgs<int>("strides")),
+        padding_type_(static_cast<Padding>(Operation::GetOptionalArg<int>(
             "padding", static_cast<int>(SAME)))),
-        paddings_(OperatorBase::GetRepeatedArgs<int>("padding_values")),
-        dilations_(OperatorBase::GetRepeatedArgs<int>("dilations", {1, 1})) {}
+        paddings_(Operation::GetRepeatedArgs<int>("padding_values")),
+        dilations_(Operation::GetRepeatedArgs<int>("dilations", {1, 1})) {}
 
  protected:
   std::vector<int> strides_;

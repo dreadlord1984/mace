@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,31 +15,33 @@
 #ifndef MACE_CORE_ALLOCATOR_H_
 #define MACE_CORE_ALLOCATOR_H_
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
 #include <map>
 #include <limits>
 #include <vector>
 #include <cstring>
 
-#include "mace/core/macros.h"
-#include "mace/core/registry.h"
+#include "mace/utils/macros.h"
 #include "mace/core/types.h"
 #include "mace/core/runtime_failure_mock.h"
 #include "mace/public/mace.h"
-#include "mace/public/mace_runtime.h"
+#include "mace/utils/logging.h"
 
 namespace mace {
 
 #if defined(__hexagon__)
 constexpr size_t kMaceAlignment = 128;
 #elif defined(__ANDROID__)
-// 16 bytes = 128 bits = 32 * 4 (Neon)
-constexpr size_t kMaceAlignment = 16;
+// arm cache line
+constexpr size_t kMaceAlignment = 64;
 #else
 // 32 bytes = 256 bits (AVX512)
 constexpr size_t kMaceAlignment = 32;
 #endif
+
+inline index_t PadAlignSize(index_t size) {
+  return (size + kMaceAlignment - 1) & (~(kMaceAlignment - 1));
+}
 
 class Allocator {
  public:
@@ -72,32 +74,9 @@ class CPUAllocator : public Allocator {
       return MaceStatus::MACE_OUT_OF_RESOURCES;
     }
 
-    void *data = nullptr;
-#if defined(__ANDROID__) || defined(__hexagon__)
-    data = memalign(kMaceAlignment, nbytes);
-    if (data == NULL) {
-      LOG(WARNING) << "Allocate CPU Buffer with "
-                   << nbytes << " bytes failed because of"
-                   << strerror(errno);
-      *result = nullptr;
-      return MaceStatus::MACE_OUT_OF_RESOURCES;
-    }
-#else
-    int ret = posix_memalign(&data, kMaceAlignment, nbytes);
-    if (ret != 0) {
-      LOG(WARNING) << "Allocate CPU Buffer with "
-                   << nbytes << " bytes failed because of"
-                   << strerror(errno);
-      if (data != NULL) {
-        free(data);
-      }
-      *result = nullptr;
-      return MaceStatus::MACE_OUT_OF_RESOURCES;
-    }
-#endif
+    MACE_RETURN_IF_ERROR(Memalign(result, kMaceAlignment, nbytes));
     // TODO(heliangliang) This should be avoided sometimes
-    memset(data, 0, nbytes);
-    *result = data;
+    memset(*result, 0, nbytes);
     return MaceStatus::MACE_SUCCESS;
   }
 
@@ -138,26 +117,8 @@ class CPUAllocator : public Allocator {
   bool OnHost() const override { return true; }
 };
 
-std::map<int32_t, Allocator *> *gAllocatorRegistry();
-
-Allocator *GetDeviceAllocator(DeviceType type);
-
-struct AllocatorRegisterer {
-  explicit AllocatorRegisterer(DeviceType type, Allocator *alloc) {
-    if (gAllocatorRegistry()->count(type)) {
-      LOG(ERROR) << "Allocator for device type " << type
-                 << " registered twice. This should not happen."
-                 << gAllocatorRegistry()->count(type);
-      std::exit(1);
-    }
-    gAllocatorRegistry()->emplace(type, alloc);
-  }
-};
-
-#define MACE_REGISTER_ALLOCATOR(type, alloc)                                  \
-  namespace {                                                                 \
-  static AllocatorRegisterer MACE_ANONYMOUS_VARIABLE(Allocator)(type, alloc); \
-  }
+// Global CPU allocator used for CPU/GPU/DSP
+Allocator *GetCPUAllocator();
 
 }  // namespace mace
 

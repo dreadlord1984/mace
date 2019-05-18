@@ -1,15 +1,23 @@
 workspace(name = "mace")
 
+# generate version and opencl kernel code.
+load("//repository/git:git_configure.bzl", "git_version_repository")
+load("//repository/opencl-kernel:opencl_kernel_configure.bzl", "encrypt_opencl_kernel_repository")
+
+git_version_repository(name = "local_version_config")
+
+encrypt_opencl_kernel_repository(name = "local_opencl_kernel_encrypt")
+
 # proto_library rules implicitly depend on @com_google_protobuf//:protoc,
 # which is the proto-compiler.
 # This statement defines the @com_google_protobuf repo.
 http_archive(
     name = "com_google_protobuf",
-    sha256 = "542703acadc3f690d998f4641e1b988f15ba57ebca05fdfb1cd9095bec007948",
-    strip_prefix = "protobuf-3.4.0",
+    sha256 = "d7a221b3d4fb4f05b7473795ccea9e05dab3b8721f6286a95fffbffc2d926f8b",
+    strip_prefix = "protobuf-3.6.1",
     urls = [
-        "https://cnbj1.fds.api.xiaomi.com/mace/third-party/protobuf/protobuf-3.4.0.zip",
-        "https://github.com/google/protobuf/archive/v3.4.0.zip",
+        "https://cnbj1.fds.api.xiaomi.com/mace/third-party/protobuf/protobuf-3.6.1.zip",
+        "https://github.com/google/protobuf/archive/v3.6.1.zip",
     ],
 )
 
@@ -27,11 +35,11 @@ new_http_archive(
 new_http_archive(
     name = "opencl_headers",
     build_file = "third_party/opencl-headers/opencl-headers.BUILD",
-    sha256 = "5dc7087680853b5c825360fc04ca26534f4b9f22ac114c4d3a306bfbec3cd0f2",
-    strip_prefix = "OpenCL-Headers-master",
+    sha256 = "b2b813dd88a7c39eb396afc153070f8f262504a7f956505b2049e223cfc2229b",
+    strip_prefix = "OpenCL-Headers-f039db6764d52388658ef15c30b2237bbda49803",
     urls = [
-        "https://cnbj1.fds.api.xiaomi.com/mace/third-party/OpenCL-Headers/OpenCL-Headers-master.zip",
-        "https://github.com/KhronosGroup/OpenCL-Headers/archive/master.zip",
+        "https://cnbj1.fds.api.xiaomi.com/mace/third-party/OpenCL-Headers/f039db6764d52388658ef15c30b2237bbda49803.zip",
+        "https://github.com/KhronosGroup/OpenCL-Headers/archive/f039db6764d52388658ef15c30b2237bbda49803.zip",
     ],
 )
 
@@ -53,7 +61,6 @@ new_http_archive(
     strip_prefix = "half-code-356-trunk",
     urls = [
         "https://cnbj1.fds.api.xiaomi.com/mace/third-party/half/half-code-356-trunk.zip",
-        "https://sourceforge.net/code-snapshots/svn/h/ha/half/code/half-code-356-trunk.zip",
     ],
 )
 
@@ -71,11 +78,19 @@ new_http_archive(
 
 http_archive(
     name = "gemmlowp",
-    sha256 = "b87faa7294dfcc5d678f22a59d2c01ca94ea1e2a3b488c38a95a67889ed0a658",
-    strip_prefix = "gemmlowp-38ebac7b059e84692f53e5938f97a9943c120d98",
+    sha256 = "f340384e7728cea605e83597593699dfe8d13ff333b834d24c256935e3dc1758",
+    strip_prefix = "gemmlowp-master-48c0547a046d49b466aa01e3a82a18028f288924",
     urls = [
-        "http://cnbj1.fds.api.xiaomi.com/mace/third-party/gemmlowp/38ebac7b059e84692f53e5938f97a9943c120d98.zip",
-        "https://github.com/google/gemmlowp/archive/38ebac7b059e84692f53e5938f97a9943c120d98.zip",
+        "http://cnbj1.fds.api.xiaomi.com/mace/third-party/gemmlowp/gemmlowp-master-48c0547a046d49b466aa01e3a82a18028f288924.zip",
+    ],
+)
+
+http_archive(
+    name = "tflite",
+    sha256 = "6f2671a02fe635a82c289c8c40a6e5bc24670ff1d4c3c2ab4a7aa9b825256a18",
+    strip_prefix = "tensorflow-mace-d73e88fc830320d3818ac24e57cd441820a85cc9",
+    urls = [
+        "http://cnbj1.fds.api.xiaomi.com/mace/third-party/tflite/tensorflow-mace-d73e88fc830320d3818ac24e57cd441820a85cc9.zip",
     ],
 )
 
@@ -122,4 +137,27 @@ android_ndk_repository(
     name = "androidndk",
     # Android 5.0
     api_level = 21,
+)
+
+# Set up default cross compilers for arm linux
+new_http_archive(
+    name = "gcc_linaro_7_3_1_arm_linux_gnueabihf",
+    build_file = "third_party/compilers/arm_compiler.BUILD",
+    sha256 = "7248bf105d0d468887a9b8a7120bb281ac8ad0223d9cb3d00dc7c2d498485d91",
+    strip_prefix = "gcc-linaro-7.3.1-2018.05-x86_64_arm-linux-gnueabihf",
+    urls = [
+        "https://cnbj1.fds.api.xiaomi.com/mace/third-party/gcc-linaro/gcc-linaro-7.3.1-2018.05-x86_64_arm-linux-gnueabihf.tar.xz",
+        "https://releases.linaro.org/components/toolchain/binaries/7.3-2018.05/arm-linux-gnueabihf/gcc-linaro-7.3.1-2018.05-x86_64_arm-linux-gnueabihf.tar.xz",
+    ],
+)
+
+new_http_archive(
+    name = "gcc_linaro_7_3_1_aarch64_linux_gnu",
+    build_file = "third_party/compilers/aarch64_compiler.BUILD",
+    sha256 = "73eed74e593e2267504efbcf3678918bb22409ab7afa3dc7c135d2c6790c2345",
+    strip_prefix = "gcc-linaro-7.3.1-2018.05-x86_64_aarch64-linux-gnu",
+    urls = [
+        "https://cnbj1.fds.api.xiaomi.com/mace/third-party/gcc-linaro/gcc-linaro-7.3.1-2018.05-x86_64_aarch64-linux-gnu.tar.xz",
+        "https://releases.linaro.org/components/toolchain/binaries/7.3-2018.05/aarch64-linux-gnu/gcc-linaro-7.3.1-2018.05-x86_64_aarch64-linux-gnu.tar.xz",
+    ],
 )

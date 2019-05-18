@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 
 #include "mace/proto/mace.pb.h"
 #include "mace/public/mace.h"
-#include "mace/utils/env_time.h"
+#include "mace/port/env.h"
 #include "mace/utils/logging.h"
 
 namespace mace {
@@ -80,33 +80,38 @@ void CreateOperator{{i}}(mace::OperatorDef *op) {
   arg->set_i({{ arg.i }});
   {%- endif %}
   {%- if arg.HasField('s') %}
-  arg->set_s({{ arg.s|tojson }});
+  arg->set_s({{ arg.s.decode('utf-8')|tojson }});
   {%- endif %}
 
-  arg->mutable_floats()->Reserve({{ arg.floats|length }});
-  {% for float_value in arg.floats %}
-  arg->add_floats({{ float_value }});
-  {% endfor %}
-  arg->mutable_ints()->Reserve({{ arg.ints|length }});
-  {% for int_value in arg.ints %}
-  arg->add_ints({{ int_value }});
-  {% endfor %}
+  {% if arg.floats|length > 0 %}
+    arg->mutable_floats()->Reserve({{ arg.floats|length }});
+    {% for float_value in arg.floats %}
+    arg->add_floats({{ float_value }});
+    {% endfor %}
+  {% endif %}
+
+  {% if arg.ints|length > 0 %}
+    arg->mutable_ints()->Reserve({{ arg.ints|length }});
+    {% for int_value in arg.ints %}
+    arg->add_ints({{ int_value }});
+    {% endfor %}
+  {% endif %}
 
   {% endfor %}
 
   {% if net.op[i].output_shape|length > 0 %}
   op->mutable_output_shape()->Reserve({{ net.op[i].output_shape|length }});
-  mace::OutputShape * output_shape = nullptr;
   {% for shape in net.op[i].output_shape %}
   {% if shape.dims|length > 0 %}
-  output_shape = op->add_output_shape();
-
-  output_shape->mutable_dims()->Reserve({{ shape.dims|length }});
-  {% for dim in shape.dims %}
-  output_shape->add_dims({{ dim }});
-  {% endfor %}
-
+  {
+      mace::OutputShape *output_shape = op->add_output_shape();
+      output_shape->mutable_dims()->Reserve({{ shape.dims|length }});
+      {% for dim in shape.dims %}
+      output_shape->add_dims({{ dim }});
+      {% endfor %}
+  }
   {% endif %}
+
   {% endfor %}
   {% endif %}
 
@@ -122,7 +127,17 @@ void CreateOperator{{i}}(mace::OperatorDef *op) {
           {{ net.op[i].node_id }},
           { {{ net.op[i].mem_id | join(', ') }} });
 
-  {% if runtime == 'dsp' %}
+
+  op->mutable_quantize_info()->Reserve({{ net.op[i].quantize_info | length }});
+  {% for j in range(net.op[i].quantize_info|length) %}
+    auto quantize_info{{j}} = op->add_quantize_info();
+    quantize_info{{j}}->set_scale({{ net.op[i].quantize_info[j].scale }});
+    quantize_info{{j}}->set_zero_point({{ net.op[i].quantize_info[j].zero_point }});
+    quantize_info{{j}}->set_minval({{ net.op[i].quantize_info[j].minval }});
+    quantize_info{{j}}->set_maxval({{ net.op[i].quantize_info[j].maxval }});
+  {% endfor %}
+
+  {% if device == 3 %}
     op->set_padding({{ net.op[i].padding }});
     {% if net.op[i].node_input | length > 0 %}
     std::vector<int> input_node_ids({ {{ net.op[i].node_input | map(attribute='node_id') | join(', ') }} });
@@ -151,4 +166,3 @@ void CreateOperator{{i}}(mace::OperatorDef *op) {
 
 }  // namespace {{tag}}
 }  // namespace mace
-

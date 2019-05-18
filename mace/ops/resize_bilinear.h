@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,34 +15,19 @@
 #ifndef MACE_OPS_RESIZE_BILINEAR_H_
 #define MACE_OPS_RESIZE_BILINEAR_H_
 
-#include "mace/core/operator.h"
-#include "mace/kernels/resize_bilinear.h"
+#include "mace/core/types.h"
 
 namespace mace {
 namespace ops {
-
-template <DeviceType D, class T>
-class ResizeBilinearOp : public Operator<D, T> {
- public:
-  ResizeBilinearOp(const OperatorDef &operator_def, Workspace *ws)
-      : Operator<D, T>(operator_def, ws),
-        functor_(OperatorBase::GetRepeatedArgs<index_t>("size", {-1, -1}),
-                 OperatorBase::GetOptionalArg<bool>("align_corners", false)) {}
-
-  MaceStatus Run(StatsFuture *future) override {
-    const Tensor *input = this->Input(0);
-    Tensor *output = this->Output(0);
-
-    MACE_CHECK(input->dim_size() == 4, "input must be 4-dimensional.",
-               input->dim_size());
-
-    return functor_(input, output, future);
-  }
-
- private:
-  kernels::ResizeBilinearFunctor<D, T> functor_;
-};
-
+namespace resize_bilinear {
+inline float CalculateResizeScale(index_t in_size,
+                                  index_t out_size,
+                                  bool align_corners) {
+  return (align_corners && out_size > 1)
+         ? (in_size - 1) / static_cast<float>(out_size - 1)
+         : in_size / static_cast<float>(out_size);
+}
+}  // namespace resize_bilinear
 }  // namespace ops
 }  // namespace mace
 

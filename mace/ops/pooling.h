@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,48 +15,12 @@
 #ifndef MACE_OPS_POOLING_H_
 #define MACE_OPS_POOLING_H_
 
-#include <vector>
-
-#include "mace/core/operator.h"
-#include "mace/kernels/pooling.h"
-#include "mace/ops/conv_pool_2d_base.h"
 
 namespace mace {
-namespace ops {
-
-template <DeviceType D, class T>
-class PoolingOp : public ConvPool2dOpBase<D, T> {
- public:
-  PoolingOp(const OperatorDef &op_def, Workspace *ws)
-      : ConvPool2dOpBase<D, T>(op_def, ws),
-        kernels_(OperatorBase::GetRepeatedArgs<int>("kernels")),
-        pooling_type_(
-            static_cast<PoolingType>(OperatorBase::GetOptionalArg<int>(
-                "pooling_type", static_cast<int>(AVG)))),
-        functor_(pooling_type_,
-                 kernels_.data(),
-                 this->strides_.data(),
-                 this->padding_type_,
-                 this->paddings_,
-                 this->dilations_.data()) {}
-
-  MaceStatus Run(StatsFuture *future) override {
-    const Tensor *input = this->Input(INPUT);
-    Tensor *output = this->Output(OUTPUT);
-
-    return functor_(input, output, future);
-  };
-
- protected:
-  std::vector<int> kernels_;
-  PoolingType pooling_type_;
-  kernels::PoolingFunctor<D, T> functor_;
-
-  MACE_OP_INPUT_TAGS(INPUT);
-  MACE_OP_OUTPUT_TAGS(OUTPUT);
+enum PoolingType {
+  AVG = 1,  // avg_pool
+  MAX = 2,  // max_pool
 };
-
-}  // namespace ops
 }  // namespace mace
 
 #endif  // MACE_OPS_POOLING_H_

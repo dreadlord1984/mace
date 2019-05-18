@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,18 +15,22 @@
 #ifndef MACE_CORE_FUTURE_H_
 #define MACE_CORE_FUTURE_H_
 
+#include <algorithm>
 #include <functional>
+#include <vector>
 
 #include "mace/utils/logging.h"
+#include "mace/public/mace.h"
 
 namespace mace {
 
-struct CallStats;
-
 // Wait the call to finish and get the stats if param is not nullptr
 struct StatsFuture {
-  std::function<void(CallStats *)> wait_fn = [](CallStats *) {
-    LOG(FATAL) << "wait_fn must be properly set";
+  std::function<void(CallStats *)> wait_fn = [](CallStats *stats) {
+    if (stats != nullptr) {
+      stats->start_micros = NowMicros();
+      stats->end_micros = stats->start_micros;
+    }
   };
 };
 
@@ -36,6 +40,29 @@ inline void SetFutureDefaultWaitFn(StatsFuture *future) {
       if (stats != nullptr) {
         stats->start_micros = NowMicros();
         stats->end_micros = stats->start_micros;
+      }
+    };
+  }
+}
+
+inline void MergeMultipleFutureWaitFn(
+    const std::vector<StatsFuture> &org_futures,
+    StatsFuture *dst_future) {
+  if (dst_future != nullptr) {
+    dst_future->wait_fn = [org_futures](CallStats *stats) {
+      if (stats != nullptr) {
+        stats->start_micros = INT64_MAX;
+        stats->end_micros = 0;
+        for (auto &org_future : org_futures) {
+          CallStats tmp_stats;
+          if (org_future.wait_fn != nullptr) {
+            org_future.wait_fn(&tmp_stats);
+            stats->start_micros = std::min(stats->start_micros,
+                                           tmp_stats.start_micros);
+            stats->end_micros += tmp_stats.end_micros - tmp_stats.start_micros;
+          }
+        }
+        stats->end_micros += stats->start_micros;
       }
     };
   }

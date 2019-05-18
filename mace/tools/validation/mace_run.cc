@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,48 +24,28 @@
  *          --model_data_file=model_data.data \
  *          --device=GPU
  */
-#include <malloc.h>
 #include <stdint.h>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <numeric>
 
 #include "gflags/gflags.h"
 #include "mace/public/mace.h"
-#include "mace/public/mace_runtime.h"
-#include "mace/utils/env_time.h"
+#include "mace/port/env.h"
+#include "mace/port/file_system.h"
 #include "mace/utils/logging.h"
-#include "mace/utils/utils.h"
+#include "mace/utils/memory.h"
+#include "mace/utils/string_util.h"
 
+#ifdef MODEL_GRAPH_FORMAT_CODE
 #include "mace/codegen/engine/mace_engine_factory.h"
+#endif
 
 namespace mace {
 namespace tools {
 namespace validation {
-
-namespace str_util {
-
-std::vector<std::string> Split(const std::string &str, char delims) {
-  std::vector<std::string> result;
-  if (str.empty()) {
-    result.push_back("");
-    return result;
-  }
-  std::string tmp = str;
-  while (!tmp.empty()) {
-    size_t next_offset = tmp.find(delims);
-    result.push_back(tmp.substr(0, next_offset));
-    if (next_offset == std::string::npos) {
-      break;
-    } else {
-      tmp = tmp.substr(next_offset + 1);
-    }
-  }
-  return result;
-}
-
-}  // namespace str_util
 
 void ParseShape(const std::string &str, std::vector<int64_t> *shape) {
   std::string tmp = str;
@@ -96,92 +76,74 @@ DeviceType ParseDeviceType(const std::string &device_str) {
     return DeviceType::GPU;
   } else if (device_str.compare("HEXAGON") == 0) {
     return DeviceType::HEXAGON;
+  } else if (device_str.compare("HTA") == 0) {
+    return DeviceType::HTA;
+  } else if (device_str.compare("APU") == 0) {
+    return DeviceType::APU;
   } else {
     return DeviceType::CPU;
   }
 }
 
-struct mallinfo LogMallinfoChange(struct mallinfo prev) {
-  struct mallinfo curr = mallinfo();
-  if (prev.arena != curr.arena) {
-    LOG(INFO) << "Non-mmapped space allocated (bytes): " << curr.arena
-              << ", diff: " << ((int64_t) curr.arena - (int64_t) prev.arena);
+DataFormat ParseDataFormat(const std::string &data_format_str) {
+  if (data_format_str == "NHWC") {
+    return DataFormat::NHWC;
+  } else if (data_format_str == "NCHW") {
+    return DataFormat::NCHW;
+  } else if (data_format_str == "OIHW") {
+    return DataFormat::OIHW;
+  } else {
+    return DataFormat::NONE;
   }
-  if (prev.ordblks != curr.ordblks) {
-    LOG(INFO) << "Number of free chunks: " << curr.ordblks
-              << ", diff: "
-              << ((int64_t) curr.ordblks - (int64_t) prev.ordblks);
-  }
-  if (prev.smblks != curr.smblks) {
-    LOG(INFO) << "Number of free fastbin blocks: " << curr.smblks
-              << ", diff: " << ((int64_t) curr.smblks - (int64_t) prev.smblks);
-  }
-  if (prev.hblks != curr.hblks) {
-    LOG(INFO) << "Number of mmapped regions: " << curr.hblks
-              << ", diff: " << ((int64_t) curr.hblks - (int64_t) prev.hblks);
-  }
-  if (prev.hblkhd != curr.hblkhd) {
-    LOG(INFO) << "Space allocated in mmapped regions (bytes): " << curr.hblkhd
-              << ", diff: " << ((int64_t) curr.hblkhd - (int64_t) prev.hblkhd);
-  }
-  if (prev.usmblks != curr.usmblks) {
-    LOG(INFO) << "Maximum total allocated space (bytes): " << curr.usmblks
-              << ", diff: "
-              << ((int64_t) curr.usmblks - (int64_t) prev.usmblks);
-  }
-  if (prev.fsmblks != curr.fsmblks) {
-    LOG(INFO) << "Space in freed fastbin blocks (bytes): " << curr.fsmblks
-              << ", diff: "
-              << ((int64_t) curr.fsmblks - (int64_t) prev.fsmblks);
-  }
-  if (prev.uordblks != curr.uordblks) {
-    LOG(INFO) << "Total allocated space (bytes): " << curr.uordblks
-              << ", diff: "
-              << ((int64_t) curr.uordblks - (int64_t) prev.uordblks);
-  }
-  if (prev.fordblks != curr.fordblks) {
-    LOG(INFO) << "Total free space (bytes): " << curr.fordblks << ", diff: "
-              << ((int64_t) curr.fordblks - (int64_t) prev.fordblks);
-  }
-  if (prev.keepcost != curr.keepcost) {
-    LOG(INFO) << "Top-most, releasable space (bytes): " << curr.keepcost
-              << ", diff: "
-              << ((int64_t) curr.keepcost - (int64_t) prev.keepcost);
-  }
-  return curr;
 }
 
 DEFINE_string(model_name,
               "",
               "model name in yaml");
 DEFINE_string(input_node,
-              "input_node0,input_node1",
+              "",
               "input nodes, separated by comma");
 DEFINE_string(input_shape,
-              "1,224,224,3:1,1,1,10",
+              "",
               "input shapes, separated by colon and comma");
 DEFINE_string(output_node,
-              "output_node0,output_node1",
+              "",
               "output nodes, separated by comma");
 DEFINE_string(output_shape,
-              "1,224,224,2:1,1,1,10",
+              "",
               "output shapes, separated by colon and comma");
+DEFINE_string(input_data_format,
+              "NHWC",
+              "input data formats, NONE|NHWC|NCHW");
+DEFINE_string(output_data_format,
+              "NHWC",
+              "output data formats, NONE|NHWC|NCHW");
 DEFINE_string(input_file,
               "",
               "input file name | input file prefix for multiple inputs.");
 DEFINE_string(output_file,
               "",
               "output file name | output file prefix for multiple outputs");
+// TODO(liyin): support batch validation
+DEFINE_string(input_dir,
+              "",
+              "input directory name");
+DEFINE_string(output_dir,
+              "output",
+              "output directory name");
 DEFINE_string(opencl_binary_file,
               "",
               "compiled opencl binary file path");
+DEFINE_string(opencl_parameter_file,
+              "",
+              "tuned OpenCL parameter file path");
 DEFINE_string(model_data_file,
               "",
               "model data file name, used when EMBED_MODEL_DATA set to 0 or 2");
 DEFINE_string(model_file,
               "",
               "model file name, used when load mace model in pb");
-DEFINE_string(device, "GPU", "CPU/GPU/HEXAGON");
+DEFINE_string(device, "GPU", "CPU/GPU/HEXAGON/APU");
 DEFINE_int32(round, 1, "round");
 DEFINE_int32(restart_round, 1, "restart round");
 DEFINE_int32(malloc_check_cycle, -1, "malloc debug check cycle, -1 to disable");
@@ -194,75 +156,120 @@ DEFINE_int32(cpu_affinity_policy, 1,
 bool RunModel(const std::string &model_name,
               const std::vector<std::string> &input_names,
               const std::vector<std::vector<int64_t>> &input_shapes,
+              const std::vector<DataFormat> &input_data_formats,
               const std::vector<std::string> &output_names,
-              const std::vector<std::vector<int64_t>> &output_shapes) {
+              const std::vector<std::vector<int64_t>> &output_shapes,
+              const std::vector<DataFormat> &output_data_formats,
+              float cpu_capability) {
   DeviceType device_type = ParseDeviceType(FLAGS_device);
+
+  int64_t t0 = NowMicros();
   // config runtime
-  mace::SetOpenMPThreadPolicy(
-      FLAGS_omp_num_threads,
-      static_cast<CPUAffinityPolicy >(FLAGS_cpu_affinity_policy));
+  MaceStatus status;
+  MaceEngineConfig config(device_type);
+  status = config.SetCPUThreadPolicy(
+          FLAGS_omp_num_threads,
+          static_cast<CPUAffinityPolicy >(FLAGS_cpu_affinity_policy));
+  if (status != MaceStatus::MACE_SUCCESS) {
+    LOG(WARNING) << "Set openmp or cpu affinity failed.";
+  }
 #ifdef MACE_ENABLE_OPENCL
+  std::shared_ptr<GPUContext> gpu_context;
   if (device_type == DeviceType::GPU) {
-    mace::SetGPUHints(
+    const char *storage_path_ptr = getenv("MACE_INTERNAL_STORAGE_PATH");
+    const std::string storage_path =
+        std::string(storage_path_ptr == nullptr ?
+                    "/data/local/tmp/mace_run/interior" : storage_path_ptr);
+    std::vector<std::string> opencl_binary_paths = {FLAGS_opencl_binary_file};
+
+    gpu_context = GPUContextBuilder()
+        .SetStoragePath(storage_path)
+        .SetOpenCLBinaryPaths(opencl_binary_paths)
+        .SetOpenCLParameterPath(FLAGS_opencl_parameter_file)
+        .Finalize();
+
+    config.SetGPUContext(gpu_context);
+    config.SetGPUHints(
         static_cast<GPUPerfHint>(FLAGS_gpu_perf_hint),
         static_cast<GPUPriorityHint>(FLAGS_gpu_priority_hint));
-
-    std::vector<std::string> opencl_binary_paths = {FLAGS_opencl_binary_file};
-    mace::SetOpenCLBinaryPaths(opencl_binary_paths);
   }
 #endif  // MACE_ENABLE_OPENCL
 
-  const char *kernel_path = getenv("MACE_INTERNAL_STORAGE_PATH");
-  const std::string kernel_file_path =
-      std::string(kernel_path == nullptr ?
-                  "/data/local/tmp/mace_run/interior" : kernel_path);
-
-  std::shared_ptr<KVStorageFactory> storage_factory(
-      new FileStorageFactory(kernel_file_path));
-  SetKVStorageFactory(storage_factory);
-
-  std::vector<unsigned char> model_pb_data;
+  std::unique_ptr<mace::port::ReadOnlyMemoryRegion> model_graph_data =
+    make_unique<mace::port::ReadOnlyBufferMemoryRegion>();
   if (FLAGS_model_file != "") {
-    if (!mace::ReadBinaryFile(&model_pb_data, FLAGS_model_file)) {
+    auto fs = GetFileSystem();
+    status = fs->NewReadOnlyMemoryRegionFromFile(FLAGS_model_file.c_str(),
+        &model_graph_data);
+    if (status != MaceStatus::MACE_SUCCESS) {
       LOG(FATAL) << "Failed to read file: " << FLAGS_model_file;
+    }
+  }
+
+  std::unique_ptr<mace::port::ReadOnlyMemoryRegion> model_weights_data =
+    make_unique<mace::port::ReadOnlyBufferMemoryRegion>();
+  if (FLAGS_model_data_file != "") {
+    auto fs = GetFileSystem();
+    status = fs->NewReadOnlyMemoryRegionFromFile(FLAGS_model_data_file.c_str(),
+        &model_weights_data);
+    if (status != MaceStatus::MACE_SUCCESS) {
+      LOG(FATAL) << "Failed to read file: " << FLAGS_model_data_file;
     }
   }
 
   std::shared_ptr<mace::MaceEngine> engine;
   MaceStatus create_engine_status;
 
-  double init_millis;
   while (true) {
     // Create Engine
     int64_t t0 = NowMicros();
-    if (FLAGS_model_file != "") {
-      create_engine_status =
-          CreateMaceEngineFromProto(model_pb_data,
-                                    FLAGS_model_data_file,
-                                    input_names,
-                                    output_names,
-                                    device_type,
-                                    &engine);
-    } else {
-      create_engine_status =
+#ifdef MODEL_GRAPH_FORMAT_CODE
+    if (model_name.empty()) {
+      LOG(INFO) << "Please specify model name you want to run";
+      return false;
+    }
+    create_engine_status =
           CreateMaceEngineFromCode(model_name,
-                                   FLAGS_model_data_file,
+                                   reinterpret_cast<const unsigned char *>(
+                                     model_weights_data->data()),
+                                   model_weights_data->length(),
                                    input_names,
                                    output_names,
-                                   device_type,
+                                   config,
                                    &engine);
+#else
+    (void)(model_name);
+    if (model_graph_data == nullptr || model_weights_data == nullptr) {
+      LOG(INFO) << "Please specify model graph file and model data file";
+      return false;
     }
+    create_engine_status =
+        CreateMaceEngineFromProto(reinterpret_cast<const unsigned char *>(
+                                    model_graph_data->data()),
+                                  model_graph_data->length(),
+                                  reinterpret_cast<const unsigned char *>(
+                                    model_weights_data->data()),
+                                  model_weights_data->length(),
+                                  input_names,
+                                  output_names,
+                                  config,
+                                  &engine);
+#endif
     int64_t t1 = NowMicros();
 
-    if (create_engine_status != MACE_SUCCESS) {
+    if (create_engine_status != MaceStatus::MACE_SUCCESS) {
       LOG(ERROR) << "Create engine runtime error, retry ... errcode: "
-                 << create_engine_status;
+                 << create_engine_status.information();
     } else {
-      init_millis = (t1 - t0) / 1000.0;
-      LOG(INFO) << "Total init latency: " << init_millis << " ms";
+      double create_engine_millis = (t1 - t0) / 1000.0;
+      LOG(INFO) << "Create Mace Engine latency: " << create_engine_millis
+                << " ms";
       break;
     }
   }
+  int64_t t1 = NowMicros();
+  double init_millis = (t1 - t0) / 1000.0;
+  LOG(INFO) << "Total init latency: " << init_millis << " ms";
 
   const size_t input_count = input_names.size();
   const size_t output_count = output_names.size();
@@ -271,32 +278,36 @@ bool RunModel(const std::string &model_name,
   std::map<std::string, mace::MaceTensor> outputs;
   for (size_t i = 0; i < input_count; ++i) {
     // Allocate input and output
+    // only support float and int32, use char for generalization
+    // sizeof(int) == 4, sizeof(float) == 4
     int64_t input_size =
-        std::accumulate(input_shapes[i].begin(), input_shapes[i].end(), 1,
+        std::accumulate(input_shapes[i].begin(), input_shapes[i].end(), 4,
                         std::multiplies<int64_t>());
-    auto buffer_in = std::shared_ptr<float>(new float[input_size],
-                                            std::default_delete<float[]>());
+    auto buffer_in = std::shared_ptr<char>(new char[input_size],
+                                           std::default_delete<char[]>());
     // load input
     std::ifstream in_file(FLAGS_input_file + "_" + FormatName(input_names[i]),
                           std::ios::in | std::ios::binary);
     if (in_file.is_open()) {
-      in_file.read(reinterpret_cast<char *>(buffer_in.get()),
-                   input_size * sizeof(float));
+      in_file.read(buffer_in.get(), input_size);
       in_file.close();
     } else {
       LOG(INFO) << "Open input file failed";
       return -1;
     }
-    inputs[input_names[i]] = mace::MaceTensor(input_shapes[i], buffer_in);
+    inputs[input_names[i]] = mace::MaceTensor(input_shapes[i], buffer_in,
+        input_data_formats[i]);
   }
 
   for (size_t i = 0; i < output_count; ++i) {
+    // only support float and int32, use char for generalization
     int64_t output_size =
-        std::accumulate(output_shapes[i].begin(), output_shapes[i].end(), 1,
+        std::accumulate(output_shapes[i].begin(), output_shapes[i].end(), 4,
                         std::multiplies<int64_t>());
-    auto buffer_out = std::shared_ptr<float>(new float[output_size],
-                                             std::default_delete<float[]>());
-    outputs[output_names[i]] = mace::MaceTensor(output_shapes[i], buffer_out);
+    auto buffer_out = std::shared_ptr<char>(new char[output_size],
+                                            std::default_delete<char[]>());
+    outputs[output_names[i]] = mace::MaceTensor(output_shapes[i], buffer_out,
+        output_data_formats[i]);
   }
 
   LOG(INFO) << "Warm up run";
@@ -304,28 +315,34 @@ bool RunModel(const std::string &model_name,
   while (true) {
     int64_t t3 = NowMicros();
     MaceStatus warmup_status = engine->Run(inputs, &outputs);
-    if (warmup_status != MACE_SUCCESS) {
+    if (warmup_status != MaceStatus::MACE_SUCCESS) {
       LOG(ERROR) << "Warmup runtime error, retry ... errcode: "
-                 << warmup_status;
+                 << warmup_status.information();
       do {
-        if (FLAGS_model_file != "") {
-          create_engine_status =
-              CreateMaceEngineFromProto(model_pb_data,
-                                        FLAGS_model_data_file,
-                                        input_names,
-                                        output_names,
-                                        device_type,
-                                        &engine);
-        } else {
-          create_engine_status =
-              CreateMaceEngineFromCode(model_name,
-                                       FLAGS_model_data_file,
-                                       input_names,
-                                       output_names,
-                                       device_type,
-                                       &engine);
-        }
-      } while (create_engine_status != MACE_SUCCESS);
+#ifdef MODEL_GRAPH_FORMAT_CODE
+        create_engine_status =
+          CreateMaceEngineFromCode(model_name,
+                                   reinterpret_cast<const unsigned char *>(
+                                     model_weights_data->data()),
+                                   model_weights_data->length(),
+                                   input_names,
+                                   output_names,
+                                   config,
+                                   &engine);
+#else
+        create_engine_status =
+            CreateMaceEngineFromProto(reinterpret_cast<const unsigned char *>(
+                                        model_graph_data->data()),
+                                      model_graph_data->length(),
+                                      reinterpret_cast<const unsigned char *>(
+                                        model_weights_data->data()),
+                                      model_weights_data->length(),
+                                      input_names,
+                                      output_names,
+                                      config,
+                                      &engine);
+#endif
+      } while (create_engine_status != MaceStatus::MACE_SUCCESS);
     } else {
       int64_t t4 = NowMicros();
       warmup_millis = (t4 - t3) / 1000.0;
@@ -338,43 +355,52 @@ bool RunModel(const std::string &model_name,
   if (FLAGS_round > 0) {
     LOG(INFO) << "Run model";
     int64_t total_run_duration = 0;
-    struct mallinfo prev = mallinfo();
     for (int i = 0; i < FLAGS_round; ++i) {
+      std::unique_ptr<port::Logger> info_log;
+      std::unique_ptr<port::MallocLogger> malloc_logger;
+      if (FLAGS_malloc_check_cycle >= 1 && i % FLAGS_malloc_check_cycle == 0) {
+        info_log = LOG_PTR(INFO);
+        malloc_logger = port::Env::Default()->NewMallocLogger(
+            info_log.get(), MakeString(i));
+      }
       MaceStatus run_status;
       while (true) {
         int64_t t0 = NowMicros();
         run_status = engine->Run(inputs, &outputs);
-        if (run_status != MACE_SUCCESS) {
+        if (run_status != MaceStatus::MACE_SUCCESS) {
           LOG(ERROR) << "Mace run model runtime error, retry ... errcode: "
-                     << run_status;
+                     << run_status.information();
           do {
-            if (FLAGS_model_file != "") {
-              create_engine_status =
-                  CreateMaceEngineFromProto(model_pb_data,
-                                            FLAGS_model_data_file,
-                                            input_names,
-                                            output_names,
-                                            device_type,
-                                            &engine);
-            } else {
-              create_engine_status =
-                  CreateMaceEngineFromCode(model_name,
-                                           FLAGS_model_data_file,
-                                           input_names,
-                                           output_names,
-                                           device_type,
-                                           &engine);
-            }
-          } while (create_engine_status != MACE_SUCCESS);
+#ifdef MODEL_GRAPH_FORMAT_CODE
+            create_engine_status =
+              CreateMaceEngineFromCode(model_name,
+                                       reinterpret_cast<const unsigned char *>(
+                                         model_weights_data->data()),
+                                       model_weights_data->length(),
+                                       input_names,
+                                       output_names,
+                                       config,
+                                       &engine);
+#else
+            create_engine_status =
+                CreateMaceEngineFromProto(
+                    reinterpret_cast<const unsigned char *>(
+                      model_graph_data->data()),
+                    model_graph_data->length(),
+                    reinterpret_cast<const unsigned char *>(
+                      model_weights_data->data()),
+                    model_weights_data->length(),
+                    input_names,
+                    output_names,
+                    config,
+                    &engine);
+#endif
+          } while (create_engine_status != MaceStatus::MACE_SUCCESS);
         } else {
           int64_t t1 = NowMicros();
           total_run_duration += (t1 - t0);
           break;
         }
-      }
-      if (FLAGS_malloc_check_cycle >= 1 && i % FLAGS_malloc_check_cycle == 0) {
-        LOG(INFO) << "=== check malloc info change #" << i << " ===";
-        prev = LogMallinfoChange(prev);
       }
     }
     model_run_millis = total_run_duration / 1000.0 / FLAGS_round;
@@ -382,23 +408,23 @@ bool RunModel(const std::string &model_name,
   }
 
   // Metrics reporting tools depends on the format, keep in consistent
-  printf("========================================\n");
-  printf("            init      warmup     run_avg\n");
-  printf("========================================\n");
-  printf("time %11.3f %11.3f %11.3f\n",
-         init_millis, warmup_millis, model_run_millis);
+  printf("========================================================\n");
+  printf("     capability(CPU)        init      warmup     run_avg\n");
+  printf("========================================================\n");
+  printf("time %15.3f %11.3f %11.3f %11.3f\n",
+         cpu_capability, init_millis, warmup_millis, model_run_millis);
 
 
   for (size_t i = 0; i < output_count; ++i) {
     std::string output_name =
         FLAGS_output_file + "_" + FormatName(output_names[i]);
     std::ofstream out_file(output_name, std::ios::binary);
+    // only support float and int32
     int64_t output_size =
-        std::accumulate(output_shapes[i].begin(), output_shapes[i].end(), 1,
+        std::accumulate(output_shapes[i].begin(), output_shapes[i].end(), 4,
                         std::multiplies<int64_t>());
     out_file.write(
-        reinterpret_cast<char *>(outputs[output_names[i]].data().get()),
-        output_size * sizeof(float));
+        outputs[output_names[i]].data<char>().get(), output_size);
     out_file.flush();
     out_file.close();
     LOG(INFO) << "Write output file " << output_name << " with size "
@@ -409,10 +435,18 @@ bool RunModel(const std::string &model_name,
 }
 
 int Main(int argc, char **argv) {
-  std::string usage = "mace run model\nusage: " + std::string(argv[0])
-      + " [flags]";
+  std::string usage = "MACE run model tool, please specify proper arguments.\n"
+                      "usage: " + std::string(argv[0])
+                      + " --help";
   gflags::SetUsageMessage(usage);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+  std::vector<std::string> input_names = Split(FLAGS_input_node, ',');
+  std::vector<std::string> output_names = Split(FLAGS_output_node, ',');
+  if (input_names.empty() || output_names.empty()) {
+    LOG(INFO) << gflags::ProgramUsage();
+    return 0;
+  }
 
   LOG(INFO) << "model name: " << FLAGS_model_name;
   LOG(INFO) << "mace version: " << MaceVersion();
@@ -432,13 +466,8 @@ int Main(int argc, char **argv) {
   LOG(INFO) << "omp_num_threads: " << FLAGS_omp_num_threads;
   LOG(INFO) << "cpu_affinity_policy: " << FLAGS_cpu_affinity_policy;
 
-  std::vector<std::string> input_names = str_util::Split(FLAGS_input_node, ',');
-  std::vector<std::string> output_names =
-      str_util::Split(FLAGS_output_node, ',');
-  std::vector<std::string> input_shapes =
-      str_util::Split(FLAGS_input_shape, ':');
-  std::vector<std::string> output_shapes =
-      str_util::Split(FLAGS_output_shape, ':');
+  std::vector<std::string> input_shapes = Split(FLAGS_input_shape, ':');
+  std::vector<std::string> output_shapes = Split(FLAGS_output_shape, ':');
 
   const size_t input_count = input_shapes.size();
   const size_t output_count = output_shapes.size();
@@ -450,13 +479,37 @@ int Main(int argc, char **argv) {
   for (size_t i = 0; i < output_count; ++i) {
     ParseShape(output_shapes[i], &output_shape_vec[i]);
   }
+  if (input_names.size() != input_shape_vec.size()
+      || output_names.size() != output_shape_vec.size()) {
+    LOG(INFO) << "inputs' names do not match inputs' shapes "
+                 "or outputs' names do not match outputs' shapes";
+    return 0;
+  }
+  std::vector<std::string> raw_input_data_formats =
+    Split(FLAGS_input_data_format, ',');
+  std::vector<std::string> raw_output_data_formats =
+    Split(FLAGS_output_data_format, ',');
+  std::vector<DataFormat> input_data_formats(input_count);
+  std::vector<DataFormat> output_data_formats(output_count);
+  for (size_t i = 0; i < input_count; ++i) {
+    input_data_formats[i] = ParseDataFormat(raw_input_data_formats[i]);
+  }
+  for (size_t i = 0; i < output_count; ++i) {
+    output_data_formats[i] = ParseDataFormat(raw_output_data_formats[i]);
+  }
+
+
+  // get cpu capability
+  Capability cpu_capability = GetCapability(DeviceType::CPU);
+  float cpu_float32_performance = cpu_capability.float32_performance.exec_time;
 
   bool ret = false;
   for (int i = 0; i < FLAGS_restart_round; ++i) {
     VLOG(0) << "restart round " << i;
-    ret =
-        RunModel(FLAGS_model_name, input_names, input_shape_vec,
-                 output_names, output_shape_vec);
+    ret = RunModel(FLAGS_model_name,
+        input_names, input_shape_vec, input_data_formats,
+        output_names, output_shape_vec, output_data_formats,
+        cpu_float32_performance);
   }
   if (ret) {
     return 0;

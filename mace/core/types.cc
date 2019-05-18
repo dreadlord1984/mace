@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,12 +34,10 @@ bool DataTypeCanUseMemcpy(DataType dt) {
 std::string DataTypeToString(const DataType dt) {
   static std::map<DataType, std::string> dtype_string_map = {
       {DT_FLOAT, "DT_FLOAT"},
-#ifdef MACE_ENABLE_OPENCL
       {DT_HALF, "DT_HALF"},
-#endif
       {DT_UINT8, "DT_UINT8"},
-      {DT_INT32, "DT_UINT32"}};
-  MACE_CHECK(dt != DT_INVALID) << "Not support Invalid data type";
+      {DT_INT32, "DT_INT32"}};
+  MACE_CHECK(dt != DT_INVALID, "Not support Invalid data type");
   return dtype_string_map[dt];
 }
 
@@ -47,14 +45,16 @@ size_t GetEnumTypeSize(const DataType dt) {
   switch (dt) {
     case DT_FLOAT:
       return sizeof(float);
-#ifdef MACE_ENABLE_OPENCL
     case DT_HALF:
       return sizeof(half);
+#if defined(MACE_ENABLE_NEON) && defined(__ANDROID__)
+    case DT_FLOAT16:
+      return sizeof(float16_t);
 #endif
     case DT_UINT8:
       return sizeof(uint8_t);
     case DT_INT32:
-      return sizeof(uint32_t);
+      return sizeof(int32_t);
     default:
       LOG(FATAL) << "Unsupported data type: " << dt;
       return 0;

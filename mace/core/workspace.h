@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,11 +20,14 @@
 #include <vector>
 #include <memory>
 
+#include "mace/core/device.h"
 #include "mace/core/preallocated_pooled_allocator.h"
 #include "mace/core/tensor.h"
 #include "mace/public/mace.h"
 
 namespace mace {
+
+class MemoryOptimizer;
 
 class Workspace {
  public:
@@ -35,10 +38,15 @@ class Workspace {
 
   Tensor *CreateTensor(const std::string &name,
                        Allocator *alloc,
-                       DataType type);
+                       DataType type,
+                       bool is_weight = false);
 
   inline bool HasTensor(const std::string &name) const {
     return tensor_map_.find(name) != tensor_map_.end();
+  }
+
+  inline bool diffused_buffer() const {
+    return diffused_buffer_;
   }
 
   const Tensor *GetTensor(const std::string &name) const;
@@ -48,22 +56,29 @@ class Workspace {
   std::vector<std::string> Tensors() const;
 
   MaceStatus LoadModelTensor(const NetDef &net_def,
-                             DeviceType type,
+                             Device *device,
                              const unsigned char *model_data);
 
-  ScratchBuffer *GetScratchBuffer(DeviceType device_type);
+  MaceStatus PreallocateOutputTensor(const NetDef &net_def,
+                                     const MemoryOptimizer *mem_optimizer,
+                                     Device *device);
+
+  void RemoveUnusedBuffer();
+
+  void RemoveAndReloadBuffer(const NetDef &net_def,
+                             const unsigned char *model_data,
+                             Allocator *alloc);
+
+  void RemoveTensor(const std::string &name);
 
  private:
-  MaceStatus CreateOutputTensorBuffer(const NetDef &net_def,
-                                      DeviceType device_type);
-
   TensorMap tensor_map_;
 
   std::unique_ptr<BufferBase> tensor_buffer_;
 
   PreallocatedPooledAllocator preallocated_allocator_;
 
-  std::unique_ptr<ScratchBuffer> host_scratch_buffer_;
+  bool diffused_buffer_;
 
   MACE_DISABLE_COPY_AND_ASSIGN(Workspace);
 };

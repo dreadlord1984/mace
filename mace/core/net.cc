@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,82 +12,152 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
+#include <limits>
+#include <set>
+#include <unordered_set>
 #include <utility>
 
-#include "mace/core/macros.h"
+#include "mace/core/future.h"
+#include "mace/core/memory_optimizer.h"
 #include "mace/core/net.h"
-#include "mace/utils/memory_logging.h"
+#include "mace/core/op_context.h"
+#include "mace/public/mace.h"
+#include "mace/port/env.h"
+#include "mace/utils/conf_util.h"
+#include "mace/utils/logging.h"
+#include "mace/utils/macros.h"
+#include "mace/utils/math.h"
+#include "mace/utils/memory.h"
 #include "mace/utils/timer.h"
-#include "mace/utils/utils.h"
 
 namespace mace {
 
-NetBase::NetBase(const std::shared_ptr<const OperatorRegistry> op_registry,
-                 const std::shared_ptr<const NetDef> net_def,
-                 Workspace *ws,
-                 DeviceType type)
-    : name_(net_def->name()), op_registry_(op_registry) {
-  MACE_UNUSED(ws);
-  MACE_UNUSED(type);
-}
-
-SerialNet::SerialNet(const std::shared_ptr<const OperatorRegistry> op_registry,
-                     const std::shared_ptr<const NetDef> net_def,
+SerialNet::SerialNet(const OpRegistryBase *op_registry,
+                     const NetDef *net_def,
                      Workspace *ws,
-                     DeviceType type,
-                     const NetMode mode)
-    : NetBase(op_registry, net_def, ws, type), device_type_(type) {
-  MACE_LATENCY_LOGGER(1, "Constructing SerialNet ", net_def->name());
+                     Device *target_device,
+                     MemoryOptimizer *mem_optimizer)
+    : NetBase(),
+      ws_(ws),
+      target_device_(target_device),
+      cpu_device_(
+          make_unique<CPUDevice>(
+              target_device->cpu_runtime()->num_threads(),
+              target_device->cpu_runtime()->policy(),
+              &target_device->cpu_runtime()->thread_pool())) {
+  MACE_LATENCY_LOGGER(1, "Constructing SerialNet");
+
+#ifdef MACE_ENABLE_OPENCL
+  // used for memory optimization
+  std::unordered_map<std::string, MemoryType> output_mem_map;
+#endif  // MACE_ENABLE_OPENCL
+
+  OpConstructContext construct_context(ws_);
   for (int idx = 0; idx < net_def->op_size(); ++idx) {
-    const auto &operator_def = net_def->op(idx);
-    // TODO(liuqi): refactor based on PB
-    const int op_device =
-        ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
-            operator_def, "device", static_cast<int>(device_type_));
-    if (op_device == type) {
-      VLOG(3) << "Creating operator " << operator_def.name() << "("
-              << operator_def.type() << ")";
-      OperatorDef temp_def(operator_def);
-      std::unique_ptr<OperatorBase> op(
-          op_registry->CreateOperator(temp_def, ws, type, mode));
-      if (op) {
-        operators_.emplace_back(std::move(op));
+    std::shared_ptr<OperatorDef> op_def(new OperatorDef(net_def->op(idx)));
+    // Create operation
+    auto op_device_type = static_cast<DeviceType>(op_def->device_type());
+    if (op_device_type == target_device_->device_type()) {
+      construct_context.set_device(target_device_);
+    } else if (op_device_type == DeviceType::CPU) {
+      construct_context.set_device(cpu_device_.get());
+    } else {
+      LOG(FATAL) << "Encounter unexpected error: "
+                 << op_device_type << " vs " << target_device_->device_type();
+    }
+    construct_context.set_operator_def(op_def);
+
+    auto op = op_registry->CreateOperation(&construct_context,
+                                           op_device_type);
+    operators_.emplace_back(std::move(op));
+    // where to do graph reference count.
+    mem_optimizer->UpdateTensorRef(op_def.get());
+
+#ifdef MACE_ENABLE_OPENCL
+    if (target_device_->device_type() == DeviceType::GPU) {
+      // update the map : output_tensor -> MemoryType
+      MemoryType out_mem_type =
+          static_cast<MemoryType>(
+              ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
+                  net_def->op(idx), OutputMemoryTypeTagName(),
+                  static_cast<int>(MemoryType::CPU_BUFFER)));
+      for (int out_idx = 0; out_idx < op_def->output_size(); ++out_idx) {
+        output_mem_map[op_def->output(out_idx)] = out_mem_type;
       }
     }
+#endif  // MACE_ENABLE_OPENCL
   }
+  // Update output tensor reference
+  for (auto &output_info : net_def->output_info()) {
+    mem_optimizer->UpdateTensorRef(output_info.name());
+  }
+
+  // Do memory optimization
+  for (auto &op : operators_) {
+    VLOG(2) << "Operator " << op->debug_def().name() << "<" << op->device_type()
+            << ", " << op->debug_def().type() << ">";
+#ifdef MACE_ENABLE_OPENCL
+    mem_optimizer->Optimize(op->operator_def().get(), &output_mem_map);
+#else
+    mem_optimizer->Optimize(op->operator_def().get());
+#endif  // MACE_ENABLE_OPENCL
+  }
+  VLOG(1) << mem_optimizer->DebugInfo();
+}
+
+MaceStatus SerialNet::Init() {
+  MACE_LATENCY_LOGGER(1, "Initializing SerialNet");
+  OpInitContext init_context(ws_);
+  for (auto iter = operators_.begin(); iter != operators_.end(); ++iter) {
+    auto &op = *iter;
+    DeviceType device_type = op->device_type();
+    if (device_type == target_device_->device_type()) {
+      init_context.set_device(target_device_);
+    } else {
+      init_context.set_device(cpu_device_.get());
+    }
+    // Initialize the operation
+    MACE_RETURN_IF_ERROR(op->Init(&init_context));
+  }
+  return MaceStatus::MACE_SUCCESS;
 }
 
 MaceStatus SerialNet::Run(RunMetadata *run_metadata) {
   MACE_MEMORY_LOGGING_GUARD();
   MACE_LATENCY_LOGGER(1, "Running net");
+  OpContext context(ws_, cpu_device_.get());
   for (auto iter = operators_.begin(); iter != operators_.end(); ++iter) {
     auto &op = *iter;
-    MACE_LATENCY_LOGGER(2, "Running operator ", op->debug_def().name(), "(",
-                        op->debug_def().type(), "), mem_id: ",
-                        MakeListString(op->debug_def().mem_id().data(),
-                                       op->debug_def().mem_id().size()));
-    bool future_wait = (device_type_ == DeviceType::GPU &&
-                        (run_metadata != nullptr ||
-                         std::distance(iter, operators_.end()) == 1));
-
-    CallStats call_stats;
-    if (future_wait) {
-      StatsFuture future;
-      MACE_RETURN_IF_ERROR(op->Run(&future));
-      if (run_metadata != nullptr) {
-        future.wait_fn(&call_stats);
-      } else {
-        future.wait_fn(nullptr);
-      }
-    } else if (run_metadata != nullptr) {
-      call_stats.start_micros = NowMicros();
-      MACE_RETURN_IF_ERROR(op->Run(nullptr));
-      call_stats.end_micros = NowMicros();
+    DeviceType device_type = op->device_type();
+    MACE_LATENCY_LOGGER(1, "Running operator ", op->debug_def().name(),
+                        "<", device_type, ", ", op->debug_def().type(),
+                        ", ",
+                        ProtoArgHelper::GetOptionalArg<OperatorDef, int>(
+                            op->debug_def(), "T", static_cast<int>(DT_FLOAT)),
+                        ">");
+    if (device_type == target_device_->device_type()) {
+      context.set_device(target_device_);
     } else {
-      MACE_RETURN_IF_ERROR(op->Run(nullptr));
+      context.set_device(cpu_device_.get());
     }
 
-    if (run_metadata != nullptr) {
+    CallStats call_stats;
+    if (run_metadata == nullptr) {
+      MACE_RETURN_IF_ERROR(op->Run(&context));
+    } else {
+      if (device_type == DeviceType::CPU) {
+        call_stats.start_micros = NowMicros();
+        MACE_RETURN_IF_ERROR(op->Run(&context));
+        call_stats.end_micros = NowMicros();
+      } else if (device_type == DeviceType::GPU) {
+        StatsFuture future;
+        context.set_future(&future);
+        MACE_RETURN_IF_ERROR(op->Run(&context));
+        future.wait_fn(&call_stats);
+      }
+
+      // Record run metadata
       std::vector<int> strides;
       int padding_type = -1;
       std::vector<int> paddings;
@@ -96,8 +166,9 @@ MaceStatus SerialNet::Run(RunMetadata *run_metadata) {
       std::string type = op->debug_def().type();
 
       if (type.compare("Conv2D") == 0 ||
-          type.compare("FusedConv2D") == 0 ||
+          type.compare("Deconv2D") == 0 ||
           type.compare("DepthwiseConv2d") == 0 ||
+          type.compare("DepthwiseDeconv2d") == 0 ||
           type.compare("Pooling") == 0) {
         strides = op->GetRepeatedArgs<int>("strides");
         padding_type = op->GetOptionalArg<int>("padding", -1);
@@ -108,12 +179,19 @@ MaceStatus SerialNet::Run(RunMetadata *run_metadata) {
         } else {
           kernels = op->Input(1)->shape();
         }
+      } else if (type.compare("MatMul") == 0) {
+        bool transpose_a = op->GetOptionalArg<bool>("transpose_a", false);
+        kernels = op->Input(0)->shape();
+        if (transpose_a) {
+          std::swap(kernels[kernels.size() - 2], kernels[kernels.size() - 1]);
+        }
+      } else if (type.compare("FullyConnected") == 0) {
+        kernels = op->Input(1)->shape();
       }
 
       std::vector<std::vector<int64_t>> output_shapes;
-      for (auto output_shape : op->debug_def().output_shape()) {
-        output_shapes.push_back({output_shape.dims().begin(),
-                                 output_shape.dims().end()});
+      for (auto output : op->Outputs()) {
+        output_shapes.push_back(output->shape());
       }
       OperatorStats op_stats = {op->debug_def().name(), op->debug_def().type(),
                                 output_shapes,
@@ -124,30 +202,49 @@ MaceStatus SerialNet::Run(RunMetadata *run_metadata) {
 
     VLOG(3) << "Operator " << op->debug_def().name()
             << " has shape: " << MakeString(op->Output(0)->shape());
+
+    if (EnvConfEnabled("MACE_LOG_TENSOR_RANGE")) {
+      for (int i = 0; i < op->OutputSize(); ++i) {
+        if (op->debug_def().quantize_info_size() == 0) {
+          int data_type = op->GetOptionalArg("T", static_cast<int>(DT_FLOAT));
+          if (data_type == static_cast<int>(DT_FLOAT)) {
+            float max_v = std::numeric_limits<float>::lowest();
+            float min_v = std::numeric_limits<float>::max();
+            Tensor::MappingGuard guard(op->Output(i));
+            auto *output_data = op->Output(i)->data<float>();
+            for (index_t j = 0; j < op->Output(i)->size(); ++j) {
+              max_v = std::max(max_v, output_data[j]);
+              min_v = std::min(min_v, output_data[j]);
+            }
+            LOG(INFO) << "Tensor range @@" << op->debug_def().output(i)
+                      << "@@" << min_v << "," << max_v;
+          }
+        } else {
+          const int bin_size = 2048;
+          for (int ind = 0; ind < op->debug_def().quantize_info_size(); ++ind) {
+            float min_v = op->debug_def().quantize_info(ind).minval();
+            float max_v = op->debug_def().quantize_info(ind).maxval();
+            std::vector<int> bin_distribution(bin_size, 0);
+            float bin_v = (max_v - min_v) / bin_size;
+            Tensor::MappingGuard guard(op->Output(i));
+            auto *output_data = op->Output(i)->data<float>();
+            for (index_t j = 0; j < op->Output(i)->size(); ++j) {
+              int index = static_cast<int>((output_data[j] - min_v) / bin_v);
+              if (index < 0)
+                index = 0;
+              else if (index > bin_size - 1)
+                index = bin_size - 1;
+              bin_distribution[index]++;
+            }
+            LOG(INFO) << "Tensor range @@" << op->debug_def().output(i)
+                      << "@@" << min_v << "," << max_v << "@@"
+                      << MakeString(bin_distribution);
+          }
+        }
+      }
+    }
   }
 
-  return MACE_SUCCESS;
+  return MaceStatus::MACE_SUCCESS;
 }
-
-std::unique_ptr<NetBase> CreateNet(
-    const std::shared_ptr<const OperatorRegistry> op_registry,
-    const NetDef &net_def,
-    Workspace *ws,
-    DeviceType type,
-    const NetMode mode) {
-  std::shared_ptr<NetDef> tmp_net_def(new NetDef(net_def));
-  return CreateNet(op_registry, tmp_net_def, ws, type, mode);
-}
-
-std::unique_ptr<NetBase> CreateNet(
-    const std::shared_ptr<const OperatorRegistry> op_registry,
-    const std::shared_ptr<const NetDef> net_def,
-    Workspace *ws,
-    DeviceType type,
-    const NetMode mode) {
-  std::unique_ptr<NetBase> net(
-      new SerialNet(op_registry, net_def, ws, type, mode));
-  return net;
-}
-
 }  // namespace mace

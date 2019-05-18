@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@
 #include <vector>
 
 #include "mace/proto/mace.pb.h"
-#include "mace/public/mace.h"
 
 namespace mace {
 
@@ -55,6 +54,20 @@ class ProtoArgHelper {
  private:
   std::map<std::string, Argument> arg_map_;
 };
+
+template <typename T>
+void SetProtoArg(OperatorDef *op_def,
+                 const std::string &arg_name,
+                 const T&value);
+
+template <typename T>
+void SetProtoArg(NetDef *op_def,
+                 const std::string &arg_name,
+                 const T&value);
+
+const std::string OutputMemoryTypeTagName();
+
+bool IsQuantizedModel(const NetDef &def);
 
 }  // namespace mace
 

@@ -1,4 +1,4 @@
-# Copyright 2018 Xiaomi, Inc.  All rights reserved.
+# Copyright 2018 The MACE Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,64 +13,46 @@
 # limitations under the License.
 
 import argparse
-import filelock
 import glob
-import hashlib
-import os
-import re
 import sh
-import subprocess
 import sys
-import urllib
+import time
 import yaml
 
 from enum import Enum
+import six
 
 import sh_commands
-from sh_commands import BuildType
 
-from common import CaffeEnvType
-from common import DeviceType
-from common import mace_check
-from common import MaceLogger
-from common import StringFormatter
+from common import *
+from device import DeviceWrapper, DeviceManager
+
+################################
+# set environment
+################################
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 ################################
 # common definitions
 ################################
-BUILD_OUTPUT_DIR = 'build'
-PHONE_DATA_DIR = "/data/local/tmp/mace_run"
-MODEL_OUTPUT_DIR_NAME = 'model'
-MODEL_HEADER_DIR_PATH = 'include/mace/public'
-BUILD_TMP_DIR_NAME = '_tmp'
-BUILD_TMP_GENERAL_OUTPUT_DIR_NAME = 'general'
-OUTPUT_LIBRARY_DIR_NAME = 'lib'
-OUTPUT_OPENCL_BINARY_DIR_NAME = 'opencl'
-OUTPUT_OPENCL_BINARY_FILE_NAME = 'compiled_opencl_kernel'
-CL_COMPILED_BINARY_FILE_NAME = "mace_cl_compiled_program.bin"
-CODEGEN_BASE_DIR = 'mace/codegen'
-MODEL_CODEGEN_DIR = CODEGEN_BASE_DIR + '/models'
-LIBMACE_SO_TARGET = "//mace:libmace.so"
-MACE_RUN_STATIC_TARGET = "//mace/tools/validation:mace_run_static"
-MACE_RUN_SHARED_TARGET = "//mace/tools/validation:mace_run_shared"
-ALL_SOC_TAG = 'all'
 
 ABITypeStrs = [
     'armeabi-v7a',
     'arm64-v8a',
+    'arm64',
+    'armhf',
     'host',
 ]
 
-
-class ABIType(object):
-    armeabi_v7a = 'armeabi-v7a'
-    arm64_v8a = 'arm64-v8a'
-    host = 'host'
-
+ModelFormatStrs = [
+    "file",
+    "code",
+]
 
 PlatformTypeStrs = [
     "tensorflow",
     "caffe",
+    "onnx",
 ]
 PlatformType = Enum('PlatformType', [(ele, ele) for ele in PlatformTypeStrs],
                     type=str)
@@ -79,31 +61,27 @@ RuntimeTypeStrs = [
     "cpu",
     "gpu",
     "dsp",
+    "hta",
+    "apu",
     "cpu+gpu"
 ]
 
-
-class RuntimeType(object):
-    cpu = 'cpu'
-    gpu = 'gpu'
-    dsp = 'dsp'
-    cpu_gpu = 'cpu+gpu'
-
-
-CPUDataTypeStrs = [
-    "fp32",
+InOutDataTypeStrs = [
+    "int32",
+    "float32",
 ]
 
-CPUDataType = Enum('CPUDataType', [(ele, ele) for ele in CPUDataTypeStrs],
-                   type=str)
+InOutDataType = Enum('InputDataType',
+                     [(ele, ele) for ele in InOutDataTypeStrs],
+                     type=str)
 
-GPUDataTypeStrs = [
+FPDataTypeStrs = [
     "fp16_fp32",
     "fp32_fp32",
 ]
 
-GPUDataType = Enum('GPUDataType', [(ele, ele) for ele in GPUDataTypeStrs],
-                   type=str)
+FPDataType = Enum('GPUDataType', [(ele, ele) for ele in FPDataTypeStrs],
+                  type=str)
 
 DSPDataTypeStrs = [
     "uint8",
@@ -112,50 +90,35 @@ DSPDataTypeStrs = [
 DSPDataType = Enum('DSPDataType', [(ele, ele) for ele in DSPDataTypeStrs],
                    type=str)
 
+APUDataTypeStrs = [
+    "uint8",
+]
+
+APUDataType = Enum('APUDataType', [(ele, ele) for ele in APUDataTypeStrs],
+                   type=str)
+
 WinogradParameters = [0, 2, 4]
+
+DataFormatStrs = [
+    "NONE",
+    "NHWC",
+    "NCHW",
+    "OIHW",
+]
 
 
 class DefaultValues(object):
+    mace_lib_type = MACELibType.static
     omp_num_threads = -1,
     cpu_affinity_policy = 1,
     gpu_perf_hint = 3,
     gpu_priority_hint = 3,
 
 
-class YAMLKeyword(object):
-    library_name = 'library_name'
-    target_abis = 'target_abis'
-    target_socs = 'target_socs'
-    build_type = 'build_type'
-    embed_model_data = 'embed_model_data'
-    linkshared = 'linkshared'
-    models = 'models'
-    platform = 'platform'
-    model_file_path = 'model_file_path'
-    model_sha256_checksum = 'model_sha256_checksum'
-    weight_file_path = 'weight_file_path'
-    weight_sha256_checksum = 'weight_sha256_checksum'
-    subgraphs = 'subgraphs'
-    input_tensors = 'input_tensors'
-    input_shapes = 'input_shapes'
-    input_ranges = 'input_ranges'
-    output_tensors = 'output_tensors'
-    output_shapes = 'output_shapes'
-    runtime = 'runtime'
-    data_type = 'data_type'
-    limit_opencl_kernel_time = 'limit_opencl_kernel_time'
-    nnlib_graph_mode = 'nnlib_graph_mode'
-    obfuscate = 'obfuscate'
-    winograd = 'winograd'
-    validation_inputs_data = 'validation_inputs_data'
-    transformers = 'transformers'  # keep it private for now
-
-
-class ModuleName(object):
-    YAML_CONFIG = 'YAML CONFIG'
-    MODEL_CONVERTER = 'Model Converter'
-    RUN = 'RUN'
-    BENCHMARK = 'Benchmark'
+class ValidationThreshold(object):
+    cpu_threshold = 0.999,
+    gpu_threshold = 0.995,
+    quantize_threshold = 0.980,
 
 
 CPP_KEYWORDS = [
@@ -188,10 +151,14 @@ def parse_device_type(runtime):
 
     if runtime == RuntimeType.dsp:
         device_type = DeviceType.HEXAGON
+    elif runtime == RuntimeType.hta:
+        device_type = DeviceType.HTA
     elif runtime == RuntimeType.gpu:
         device_type = DeviceType.GPU
     elif runtime == RuntimeType.cpu:
         device_type = DeviceType.CPU
+    elif runtime == RuntimeType.apu:
+        device_type = DeviceType.APU
 
     return device_type
 
@@ -199,7 +166,7 @@ def parse_device_type(runtime):
 def get_hexagon_mode(configs):
     runtime_list = []
     for model_name in configs[YAMLKeyword.models]:
-        model_runtime =\
+        model_runtime = \
             configs[YAMLKeyword.models][model_name].get(
                 YAMLKeyword.runtime, "")
         runtime_list.append(model_runtime.lower())
@@ -209,9 +176,55 @@ def get_hexagon_mode(configs):
     return False
 
 
+def get_hta_mode(configs):
+    runtime_list = []
+    for model_name in configs[YAMLKeyword.models]:
+        model_runtime = \
+            configs[YAMLKeyword.models][model_name].get(
+                YAMLKeyword.runtime, "")
+        runtime_list.append(model_runtime.lower())
+
+    if RuntimeType.hta in runtime_list:
+        return True
+    return False
+
+
+def get_opencl_mode(configs):
+    runtime_list = []
+    for model_name in configs[YAMLKeyword.models]:
+        model_runtime = \
+            configs[YAMLKeyword.models][model_name].get(
+                YAMLKeyword.runtime, "")
+        runtime_list.append(model_runtime.lower())
+
+    if RuntimeType.gpu in runtime_list or RuntimeType.cpu_gpu in runtime_list:
+        return True
+    return False
+
+
+def get_quantize_mode(configs):
+    for model_name in configs[YAMLKeyword.models]:
+        quantize =\
+            configs[YAMLKeyword.models][model_name].get(
+                YAMLKeyword.quantize, 0)
+        if quantize == 1:
+            return True
+
+    return False
+
+
+def get_symbol_hidden_mode(debug_mode, mace_lib_type=None):
+    if not mace_lib_type:
+        return True
+    if debug_mode or mace_lib_type == MACELibType.dynamic:
+        return False
+    else:
+        return True
+
+
 def md5sum(str):
     md5 = hashlib.md5()
-    md5.update(str)
+    md5.update(str.encode('utf-8'))
     return md5.hexdigest()
 
 
@@ -221,6 +234,77 @@ def sha256_checksum(fname):
         for chunk in iter(lambda: f.read(4096), b""):
             hash_func.update(chunk)
     return hash_func.hexdigest()
+
+
+def download_file(url, dst, num_retries=3):
+    from six.moves import urllib
+
+    try:
+        urllib.request.urlretrieve(url, dst)
+        MaceLogger.info('\nDownloaded successfully.')
+    except (urllib.error.ContentTooShortError, urllib.error.HTTPError,
+            urllib.error.URLError) as e:
+        MaceLogger.warning('Download error:' + str(e))
+        if num_retries > 0:
+            return download_file(url, dst, num_retries - 1)
+        else:
+            return False
+    return True
+
+
+def get_model_files(model_config, model_output_dir):
+    if not os.path.exists(model_output_dir):
+        os.makedirs(model_output_dir)
+    model_file_path = model_config[YAMLKeyword.model_file_path]
+    model_sha256_checksum = model_config[YAMLKeyword.model_sha256_checksum]
+    weight_file_path = model_config.get(YAMLKeyword.weight_file_path, "")
+    weight_sha256_checksum = model_config.get(YAMLKeyword.weight_sha256_checksum, "")  # noqa
+    quantize_range_file_path = model_config.get(YAMLKeyword.quantize_range_file, "")  # noqa
+    model_file = model_file_path
+    weight_file = weight_file_path
+    quantize_range_file = quantize_range_file_path
+
+    if model_file_path.startswith("http://") or \
+            model_file_path.startswith("https://"):
+        model_file = model_output_dir + "/" + md5sum(model_file_path) + ".pb"
+        if not os.path.exists(model_file) or \
+                sha256_checksum(model_file) != model_sha256_checksum:
+            MaceLogger.info("Downloading model, please wait ...")
+            if not download_file(model_file_path, model_file):
+                MaceLogger.error(ModuleName.MODEL_CONVERTER,
+                                 "Model download failed.")
+        model_config[YAMLKeyword.model_file_path] = model_file
+
+    if sha256_checksum(model_file) != model_sha256_checksum:
+        MaceLogger.error(ModuleName.MODEL_CONVERTER,
+                         "model file sha256checksum not match")
+
+    if weight_file_path.startswith("http://") or \
+            weight_file_path.startswith("https://"):
+        weight_file = \
+            model_output_dir + "/" + md5sum(weight_file_path) + ".caffemodel"
+        if not os.path.exists(weight_file) or \
+                sha256_checksum(weight_file) != weight_sha256_checksum:
+            MaceLogger.info("Downloading model weight, please wait ...")
+            if not download_file(weight_file_path, weight_file):
+                MaceLogger.error(ModuleName.MODEL_CONVERTER,
+                                 "Model download failed.")
+    model_config[YAMLKeyword.weight_file_path] = weight_file
+
+    if weight_file:
+        if sha256_checksum(weight_file) != weight_sha256_checksum:
+            MaceLogger.error(ModuleName.MODEL_CONVERTER,
+                             "weight file sha256checksum not match")
+
+    if quantize_range_file_path.startswith("http://") or \
+            quantize_range_file_path.startswith("https://"):
+        quantize_range_file = \
+            model_output_dir + "/" + md5sum(quantize_range_file_path) \
+            + ".range"
+        if not download_file(quantize_range_file_path, quantize_range_file):
+            MaceLogger.error(ModuleName.MODEL_CONVERTER,
+                             "Model range file download failed.")
+    model_config[YAMLKeyword.quantize_range_file] = quantize_range_file
 
 
 def format_model_config(flags):
@@ -244,7 +328,11 @@ def format_model_config(flags):
                    "target_abis must be in " + str(ABITypeStrs))
 
     target_socs = configs.get(YAMLKeyword.target_socs, "")
-    if not target_socs:
+    if flags.target_socs and flags.target_socs != TargetSOCTag.random \
+            and flags.target_socs != TargetSOCTag.all:
+        configs[YAMLKeyword.target_socs] = \
+            [soc.lower() for soc in flags.target_socs.split(',')]
+    elif not target_socs:
         configs[YAMLKeyword.target_socs] = []
     elif not isinstance(target_socs, list):
         configs[YAMLKeyword.target_socs] = [target_socs]
@@ -256,10 +344,12 @@ def format_model_config(flags):
             or ABIType.arm64_v8a in target_abis:
         available_socs = sh_commands.adb_get_all_socs()
         target_socs = configs[YAMLKeyword.target_socs]
-        if ALL_SOC_TAG in target_socs:
+        if TargetSOCTag.all in target_socs:
             mace_check(available_socs,
                        ModuleName.YAML_CONFIG,
-                       "Build for all SOCs plugged in computer, "
+                       "Android abi is listed in config file and "
+                       "build for all SOCs plugged in computer, "
+                       "But no android phone found, "
                        "you at least plug in one phone")
         else:
             for soc in target_socs:
@@ -268,45 +358,30 @@ def format_model_config(flags):
                            "Build specified SOC library, "
                            "you must plug in a phone using the SOC")
 
-    build_type = BuildType.code
-    if flags.build_type:
-        build_type_str = flags.build_type
+    if flags.model_graph_format:
+        model_graph_format = flags.model_graph_format
     else:
-        build_type_str = configs.get(YAMLKeyword.build_type, "")
-    if build_type_str == BuildType.proto:
-        build_type = BuildType.proto
-    elif build_type_str == BuildType.code:
-        build_type = BuildType.code
+        model_graph_format = configs.get(YAMLKeyword.model_graph_format, "")
+    mace_check(model_graph_format in ModelFormatStrs,
+               ModuleName.YAML_CONFIG,
+               'You must set model_graph_format and '
+               "model_graph_format must be in " + str(ModelFormatStrs))
+    configs[YAMLKeyword.model_graph_format] = model_graph_format
+    if flags.model_data_format:
+        model_data_format = flags.model_data_format
     else:
-        MaceLogger.error(ModuleName.YAML_CONFIG,
-                         "Invalid build type " + build_type_str
-                         + ". only support [proto|code] format, "
-                         + "proto for converting model to ProtoBuf file, "
-                         + "code for converting model to c++ code.")
-    configs[YAMLKeyword.build_type] = build_type
-    embed_model_data = configs.get(YAMLKeyword.embed_model_data, "")
-    if embed_model_data == "" or not isinstance(embed_model_data, int) or \
-       embed_model_data < 0 or embed_model_data > 1:
-        MaceLogger.error(ModuleName.YAML_CONFIG,
-                         "embed_model_data must be 0 or 1. "
-                         "0 for embed model data to code, 1 not.")
-    if build_type == BuildType.proto:
-        configs[YAMLKeyword.embed_model_data] = 0
+        model_data_format = configs.get(YAMLKeyword.model_data_format, "")
+    configs[YAMLKeyword.model_data_format] = model_data_format
+    mace_check(model_data_format in ModelFormatStrs,
+               ModuleName.YAML_CONFIG,
+               'You must set model_data_format and '
+               "model_data_format must be in " + str(ModelFormatStrs))
 
-    linkshared = configs.get(YAMLKeyword.linkshared, "")
-    if linkshared == "":
-        configs[YAMLKeyword.linkshared] = 0
-        linkshared = 0
-    if not isinstance(linkshared, int) or linkshared < 0 or \
-       linkshared > 1:
-        MaceLogger.error(ModuleName.YAML_CONFIG,
-                         "linkshared must be 0 or 1. "
-                         "default is 0, for link mace lib statically, "
-                         "1 for dynamic linking.")
-    if build_type == BuildType.code and linkshared == 1:
-        MaceLogger.error(ModuleName.YAML_CONFIG,
-                         "'linkshared == 1' only support when "
-                         "'build_type == proto'")
+    mace_check(not (model_graph_format == ModelFormat.file
+                    and model_data_format == ModelFormat.code),
+               ModuleName.YAML_CONFIG,
+               "If model_graph format is 'file',"
+               " the model_data_format must be 'file' too")
 
     model_names = configs.get(YAMLKeyword.models, [])
     mace_check(len(model_names) > 0, ModuleName.YAML_CONFIG,
@@ -339,13 +414,15 @@ def format_model_config(flags):
 
         weight_file_path = model_config.get(YAMLKeyword.weight_file_path, "")
         if weight_file_path:
-            weight_checksum =\
+            weight_checksum = \
                 model_config.get(YAMLKeyword.weight_sha256_checksum, "")
             mace_check(weight_checksum != "", ModuleName.YAML_CONFIG,
                        "'%s' is necessary" %
                        YAMLKeyword.weight_sha256_checksum)
         else:
             model_config[YAMLKeyword.weight_sha256_checksum] = ""
+
+        get_model_files(model_config, BUILD_DOWNLOADS_DIR)
 
         runtime = model_config.get(YAMLKeyword.runtime, "")
         mace_check(runtime in RuntimeTypeStrs,
@@ -357,28 +434,7 @@ def format_model_config(flags):
                        "host only support cpu runtime now.")
 
         data_type = model_config.get(YAMLKeyword.data_type, "")
-        if runtime == RuntimeType.cpu_gpu and data_type not in GPUDataTypeStrs:
-            model_config[YAMLKeyword.data_type] = \
-                GPUDataType.fp16_fp32.value
-        elif runtime == RuntimeType.cpu:
-            if len(data_type) > 0:
-                mace_check(data_type in CPUDataTypeStrs,
-                           ModuleName.YAML_CONFIG,
-                           "'data_type' must be in " + str(CPUDataTypeStrs)
-                           + " for cpu runtime")
-            else:
-                model_config[YAMLKeyword.data_type] = \
-                    CPUDataType.fp32.value
-        elif runtime == RuntimeType.gpu:
-            if len(data_type) > 0:
-                mace_check(data_type in GPUDataTypeStrs,
-                           ModuleName.YAML_CONFIG,
-                           "'data_type' must be in " + str(GPUDataTypeStrs)
-                           + " for gpu runtime")
-            else:
-                model_config[YAMLKeyword.data_type] =\
-                    GPUDataType.fp16_fp32.value
-        elif runtime == RuntimeType.dsp:
+        if runtime == RuntimeType.dsp:
             if len(data_type) > 0:
                 mace_check(data_type in DSPDataTypeStrs,
                            ModuleName.YAML_CONFIG,
@@ -387,6 +443,28 @@ def format_model_config(flags):
             else:
                 model_config[YAMLKeyword.data_type] = \
                     DSPDataType.uint8.value
+        elif runtime == RuntimeType.apu:
+            if len(data_type) > 0:
+                mace_check(data_type in APUDataTypeStrs,
+                           ModuleName.YAML_CONFIG,
+                           "'data_type' must be in " + str(APUDataTypeStrs)
+                           + " for apu runtime")
+            else:
+                model_config[YAMLKeyword.data_type] = \
+                    APUDataType.uint8.value
+        else:
+            if len(data_type) > 0:
+                mace_check(data_type in FPDataTypeStrs,
+                           ModuleName.YAML_CONFIG,
+                           "'data_type' must be in " + str(FPDataTypeStrs)
+                           + " for cpu runtime")
+            else:
+                if runtime == RuntimeType.cpu:
+                    model_config[YAMLKeyword.data_type] = \
+                        FPDataType.fp32_fp32.value
+                else:
+                    model_config[YAMLKeyword.data_type] = \
+                        FPDataType.fp16_fp32.value
 
         subgraphs = model_config.get(YAMLKeyword.subgraphs, "")
         mace_check(len(subgraphs) > 0, ModuleName.YAML_CONFIG,
@@ -402,6 +480,117 @@ def format_model_config(flags):
                            "'%s' is necessary in subgraph" % key)
                 if not isinstance(value, list):
                     subgraph[key] = [value]
+                subgraph[key] = [str(v) for v in subgraph[key]]
+            input_size = len(subgraph[YAMLKeyword.input_tensors])
+            output_size = len(subgraph[YAMLKeyword.output_tensors])
+
+            mace_check(len(subgraph[YAMLKeyword.input_shapes]) == input_size,
+                       ModuleName.YAML_CONFIG,
+                       "input shapes' size not equal inputs' size.")
+            mace_check(len(subgraph[YAMLKeyword.output_shapes]) == output_size,
+                       ModuleName.YAML_CONFIG,
+                       "output shapes' size not equal outputs' size.")
+
+            for key in [YAMLKeyword.check_tensors,
+                        YAMLKeyword.check_shapes]:
+                value = subgraph.get(key, "")
+                if value != "":
+                    if not isinstance(value, list):
+                        subgraph[key] = [value]
+                    subgraph[key] = [str(v) for v in subgraph[key]]
+                else:
+                    subgraph[key] = []
+
+            for key in [YAMLKeyword.input_data_types,
+                        YAMLKeyword.output_data_types]:
+                if key == YAMLKeyword.input_data_types:
+                    count = input_size
+                else:
+                    count = output_size
+                data_types = subgraph.get(key, "")
+                if data_types:
+                    if not isinstance(data_types, list):
+                        subgraph[key] = [data_types] * count
+                    for data_type in subgraph[key]:
+                        mace_check(data_type in InOutDataTypeStrs,
+                                   ModuleName.YAML_CONFIG,
+                                   key + " must be in "
+                                   + str(InOutDataTypeStrs))
+                else:
+                    subgraph[key] = [InOutDataType.float32] * count
+
+            input_data_formats = subgraph.get(YAMLKeyword.input_data_formats,
+                                              [])
+            if input_data_formats:
+                if not isinstance(input_data_formats, list):
+                    subgraph[YAMLKeyword.input_data_formats] =\
+                        [input_data_formats] * input_size
+                else:
+                    mace_check(len(input_data_formats)
+                               == input_size,
+                               ModuleName.YAML_CONFIG,
+                               "input_data_formats should match"
+                               " the size of input.")
+                for input_data_format in\
+                        subgraph[YAMLKeyword.input_data_formats]:
+                    mace_check(input_data_format in DataFormatStrs,
+                               ModuleName.YAML_CONFIG,
+                               "'input_data_formats' must be in "
+                               + str(DataFormatStrs) + ", but got "
+                               + input_data_format)
+            else:
+                subgraph[YAMLKeyword.input_data_formats] = \
+                    [DataFormat.NHWC] * input_size
+
+            output_data_formats = subgraph.get(YAMLKeyword.output_data_formats,
+                                               [])
+            if output_data_formats:
+                if not isinstance(output_data_formats, list):
+                    subgraph[YAMLKeyword.output_data_formats] = \
+                        [output_data_formats] * output_size
+                else:
+                    mace_check(len(output_data_formats)
+                               == output_size,
+                               ModuleName.YAML_CONFIG,
+                               "output_data_formats should match"
+                               " the size of output")
+                for output_data_format in\
+                        subgraph[YAMLKeyword.output_data_formats]:
+                    mace_check(output_data_format in DataFormatStrs,
+                               ModuleName.YAML_CONFIG,
+                               "'output_data_formats' must be in "
+                               + str(DataFormatStrs))
+            else:
+                subgraph[YAMLKeyword.output_data_formats] =\
+                    [DataFormat.NHWC] * output_size
+
+            validation_threshold = subgraph.get(
+                YAMLKeyword.validation_threshold, {})
+            if not isinstance(validation_threshold, dict):
+                raise argparse.ArgumentTypeError(
+                    'similarity threshold must be a dict.')
+
+            threshold_dict = {
+                DeviceType.CPU: ValidationThreshold.cpu_threshold,
+                DeviceType.GPU: ValidationThreshold.gpu_threshold,
+                DeviceType.HEXAGON: ValidationThreshold.quantize_threshold,
+                DeviceType.HTA: ValidationThreshold.quantize_threshold,
+                DeviceType.QUANTIZE: ValidationThreshold.quantize_threshold,
+            }
+            for k, v in six.iteritems(validation_threshold):
+                if k.upper() == 'DSP':
+                    k = DeviceType.HEXAGON
+                if k.upper() not in (DeviceType.CPU,
+                                     DeviceType.GPU,
+                                     DeviceType.HEXAGON,
+                                     DeviceType.HTA,
+                                     DeviceType.QUANTIZE):
+                    raise argparse.ArgumentTypeError(
+                        'Unsupported validation threshold runtime: %s' % k)
+                threshold_dict[k.upper()] = v
+
+            subgraph[YAMLKeyword.validation_threshold] = threshold_dict
+
             validation_inputs_data = subgraph.get(
                 YAMLKeyword.validation_inputs_data, [])
             if not isinstance(validation_inputs_data, list):
@@ -410,20 +599,53 @@ def format_model_config(flags):
             else:
                 subgraph[YAMLKeyword.validation_inputs_data] = \
                     validation_inputs_data
+
+            onnx_backend = subgraph.get(
+                YAMLKeyword.backend, "tensorflow")
+            subgraph[YAMLKeyword.backend] = onnx_backend
+            validation_outputs_data = subgraph.get(
+                YAMLKeyword.validation_outputs_data, [])
+            if not isinstance(validation_outputs_data, list):
+                subgraph[YAMLKeyword.validation_outputs_data] = [
+                    validation_outputs_data]
+            else:
+                subgraph[YAMLKeyword.validation_outputs_data] = \
+                    validation_outputs_data
             input_ranges = subgraph.get(
                 YAMLKeyword.input_ranges, [])
             if not isinstance(input_ranges, list):
                 subgraph[YAMLKeyword.input_ranges] = [input_ranges]
             else:
                 subgraph[YAMLKeyword.input_ranges] = input_ranges
+            subgraph[YAMLKeyword.input_ranges] = \
+                [str(v) for v in subgraph[YAMLKeyword.input_ranges]]
+
+            accuracy_validation_script = subgraph.get(
+                YAMLKeyword.accuracy_validation_script, "")
+            if isinstance(accuracy_validation_script, list):
+                mace_check(len(accuracy_validation_script) == 1,
+                           ModuleName.YAML_CONFIG,
+                           "Only support one accuracy validation script")
+                accuracy_validation_script = accuracy_validation_script[0]
+            subgraph[YAMLKeyword.accuracy_validation_script] = \
+                accuracy_validation_script
 
         for key in [YAMLKeyword.limit_opencl_kernel_time,
                     YAMLKeyword.nnlib_graph_mode,
                     YAMLKeyword.obfuscate,
-                    YAMLKeyword.winograd]:
+                    YAMLKeyword.winograd,
+                    YAMLKeyword.quantize,
+                    YAMLKeyword.quantize_large_weights,
+                    YAMLKeyword.change_concat_ranges]:
             value = model_config.get(key, "")
             if value == "":
                 model_config[key] = 0
+
+        mace_check(model_config[YAMLKeyword.quantize] == 0 or
+                   model_config[YAMLKeyword.quantize_large_weights] == 0,
+                   ModuleName.YAML_CONFIG,
+                   "quantize and quantize_large_weights should not be set to 1"
+                   " at the same time.")
 
         mace_check(model_config[YAMLKeyword.winograd] in WinogradParameters,
                    ModuleName.YAML_CONFIG,
@@ -431,85 +653,30 @@ def format_model_config(flags):
                    + str(WinogradParameters) +
                    ". 0 for disable winograd convolution")
 
-        weight_file_path = model_config.get(YAMLKeyword.weight_file_path, "")
-        model_config[YAMLKeyword.weight_file_path] = weight_file_path
-
     return configs
 
 
-def get_build_binary_dir(library_name, target_abi, target_soc,
-                         serial_num):
-    if not target_soc or not serial_num:
-        binary_path_digest = md5sum(target_abi)
-        binary_path_digest = "%s_%s" % (target_abi, binary_path_digest)
-    else:
-        device_name = sh_commands.adb_get_device_name_by_serialno(serial_num)
-        binary_path_digest = md5sum(target_abi + target_soc + serial_num)
-        binary_path_digest = "%s_%s_%s" % \
-                             (device_name, target_soc, binary_path_digest)
-    return "%s/%s/%s/%s" % (
-        BUILD_OUTPUT_DIR, library_name, BUILD_TMP_DIR_NAME, binary_path_digest)
-
-
-def get_build_model_dirs(library_name, model_name, target_abi, target_soc,
-                         serial_num, model_file_path):
-    model_path_digest = md5sum(model_file_path)
-    model_output_base_dir = "%s/%s/%s/%s/%s" % (
-        BUILD_OUTPUT_DIR, library_name, BUILD_TMP_DIR_NAME,
-        model_name, model_path_digest)
-
-    if target_abi == ABIType.host:
-        model_output_dir = "%s/%s" % (model_output_base_dir, target_abi)
-    elif not target_soc or not serial_num:
-        model_output_dir = "%s/%s/%s" % (
-            model_output_base_dir, BUILD_TMP_GENERAL_OUTPUT_DIR_NAME,
-            target_abi)
-    else:
-        device_name = \
-            sh_commands.adb_get_device_name_by_serialno(serial_num)
-        model_output_dir = "%s/%s_%s/%s" % (
-            model_output_base_dir, device_name,
-            target_soc, target_abi)
-
-    mace_model_dir = \
-        '%s/%s/%s' % (BUILD_OUTPUT_DIR, library_name, MODEL_OUTPUT_DIR_NAME)
-
-    return model_output_base_dir, model_output_dir, mace_model_dir
-
-
-def get_opencl_binary_output_path(library_name, target_abi,
-                                  target_soc, serial_num):
-    device_name = \
-        sh_commands.adb_get_device_name_by_serialno(serial_num)
-    return '%s/%s/%s/%s/%s_%s.%s.%s.bin' % \
-           (BUILD_OUTPUT_DIR,
-            library_name,
-            OUTPUT_OPENCL_BINARY_DIR_NAME,
-            target_abi,
-            library_name,
-            OUTPUT_OPENCL_BINARY_FILE_NAME,
-            device_name,
-            target_soc)
-
-
-def get_shared_library_dir(library_name, abi):
-    return '%s/%s/%s/%s' % (BUILD_OUTPUT_DIR,
-                            library_name,
-                            OUTPUT_LIBRARY_DIR_NAME,
-                            abi)
+def clear_build_dirs(library_name):
+    # make build dir
+    if not os.path.exists(BUILD_OUTPUT_DIR):
+        os.makedirs(BUILD_OUTPUT_DIR)
+    # clear temp build dir
+    tmp_build_dir = os.path.join(BUILD_OUTPUT_DIR, library_name,
+                                 BUILD_TMP_DIR_NAME)
+    if os.path.exists(tmp_build_dir):
+        sh.rm('-rf', tmp_build_dir)
+    os.makedirs(tmp_build_dir)
+    # clear lib dir
+    lib_output_dir = os.path.join(
+        BUILD_OUTPUT_DIR, library_name, OUTPUT_LIBRARY_DIR_NAME)
+    if os.path.exists(lib_output_dir):
+        sh.rm('-rf', lib_output_dir)
 
 
 ################################
-# build
+# convert
 ################################
-def pull_opencl_binary_and_tuning_param(target_abi,
-                                        serialno,
-                                        model_output_dirs):
-    sh_commands.pull_binaries(target_abi, serialno, model_output_dirs,
-                              CL_COMPILED_BINARY_FILE_NAME)
-
-
-def print_configuration(flags, configs):
+def print_configuration(configs):
     title = "Common Configuration"
     header = ["key", "value"]
     data = list()
@@ -519,51 +686,14 @@ def print_configuration(flags, configs):
                  configs[YAMLKeyword.target_abis]])
     data.append([YAMLKeyword.target_socs,
                  configs[YAMLKeyword.target_socs]])
-    data.append([YAMLKeyword.build_type,
-                 configs[YAMLKeyword.build_type]])
-    data.append([YAMLKeyword.embed_model_data,
-                 configs[YAMLKeyword.embed_model_data]])
-    data.append([YAMLKeyword.linkshared,
-                 configs[YAMLKeyword.linkshared]])
-    data.append(["Tuning", flags.disable_tuning])
+    data.append([YAMLKeyword.model_graph_format,
+                 configs[YAMLKeyword.model_graph_format]])
+    data.append([YAMLKeyword.model_data_format,
+                 configs[YAMLKeyword.model_data_format]])
     MaceLogger.summary(StringFormatter.table(header, data, title))
 
 
-def download_model_files(model_file_path,
-                         model_output_dir,
-                         weight_file_path=""):
-    MaceLogger.info("Downloading model, please wait ...")
-    if model_file_path.startswith("http://") or \
-            model_file_path.startswith("https://"):
-        model_file = model_output_dir + "/model.pb"
-        urllib.urlretrieve(model_file_path, model_file)
-
-    if weight_file_path.startswith("http://") or \
-            weight_file_path.startswith("https://"):
-        weight_file = model_output_dir + "/model.caffemodel"
-        urllib.urlretrieve(weight_file_path, weight_file)
-    MaceLogger.info("Model downloaded successfully.")
-
-
-def get_model_files_path(model_file_path,
-                         model_output_dir,
-                         weight_file_path=""):
-    if model_file_path.startswith("http://") or \
-            model_file_path.startswith("https://"):
-        model_file = model_output_dir + "/model.pb"
-    else:
-        model_file = model_file_path
-
-    if weight_file_path.startswith("http://") or \
-            weight_file_path.startswith("https://"):
-        weight_file = model_output_dir + "/model.caffemodel"
-    else:
-        weight_file = weight_file_path
-
-    return model_file, weight_file
-
-
-def convert_model(configs):
+def convert_model(configs, cl_mem_type):
     # Remove previous output dirs
     library_name = configs[YAMLKeyword.library_name]
     if not os.path.exists(BUILD_OUTPUT_DIR):
@@ -571,68 +701,45 @@ def convert_model(configs):
     elif os.path.exists(os.path.join(BUILD_OUTPUT_DIR, library_name)):
         sh.rm("-rf", os.path.join(BUILD_OUTPUT_DIR, library_name))
     os.makedirs(os.path.join(BUILD_OUTPUT_DIR, library_name))
+    if not os.path.exists(BUILD_DOWNLOADS_DIR):
+        os.makedirs(BUILD_DOWNLOADS_DIR)
 
     model_output_dir = \
         '%s/%s/%s' % (BUILD_OUTPUT_DIR, library_name, MODEL_OUTPUT_DIR_NAME)
     model_header_dir = \
         '%s/%s/%s' % (BUILD_OUTPUT_DIR, library_name, MODEL_HEADER_DIR_PATH)
+    # clear output dir
     if os.path.exists(model_output_dir):
         sh.rm("-rf", model_output_dir)
     os.makedirs(model_output_dir)
     if os.path.exists(model_header_dir):
         sh.rm("-rf", model_header_dir)
-    os.makedirs(model_header_dir)
-    # copy header files
-    sh.cp("-f", glob.glob("mace/public/*.h"), model_header_dir)
 
-    sh_commands.gen_mace_engine_factory_source(
-        configs[YAMLKeyword.models].keys(),
-        configs[YAMLKeyword.build_type])
-    if configs[YAMLKeyword.build_type] == BuildType.code:
+    embed_model_data = \
+        configs[YAMLKeyword.model_data_format] == ModelFormat.code
+
+    if os.path.exists(MODEL_CODEGEN_DIR):
+        sh.rm("-rf", MODEL_CODEGEN_DIR)
+    if os.path.exists(ENGINE_CODEGEN_DIR):
+        sh.rm("-rf", ENGINE_CODEGEN_DIR)
+
+    if configs[YAMLKeyword.model_graph_format] == ModelFormat.code:
+        os.makedirs(model_header_dir)
+        sh_commands.gen_mace_engine_factory_source(
+            configs[YAMLKeyword.models].keys(),
+            embed_model_data)
         sh.cp("-f", glob.glob("mace/codegen/engine/*.h"),
               model_header_dir)
 
-    embed_model_data = configs[YAMLKeyword.embed_model_data]
-
-    sh_commands.clear_model_codegen()
     for model_name in configs[YAMLKeyword.models]:
         MaceLogger.header(
             StringFormatter.block("Convert %s model" % model_name))
         model_config = configs[YAMLKeyword.models][model_name]
         runtime = model_config[YAMLKeyword.runtime]
-
-        # Create model build directory
-        model_path_digest = md5sum(
-            model_config[YAMLKeyword.model_file_path])
-
-        model_output_base_dir = "%s/%s/%s/%s/%s" % (
-            BUILD_OUTPUT_DIR, library_name, BUILD_TMP_DIR_NAME,
-            model_name, model_path_digest)
-
-        if os.path.exists(model_output_base_dir):
-            sh.rm("-rf", model_output_base_dir)
-        os.makedirs(model_output_base_dir)
-
-        download_model_files(
-            model_config[YAMLKeyword.model_file_path],
-            model_output_base_dir,
-            model_config[YAMLKeyword.weight_file_path])
-
-        model_file_path, weight_file_path = get_model_files_path(
-            model_config[YAMLKeyword.model_file_path],
-            model_output_base_dir,
-            model_config[YAMLKeyword.weight_file_path])
-
-        if sha256_checksum(model_file_path) != \
-                model_config[YAMLKeyword.model_sha256_checksum]:
-            MaceLogger.error(ModuleName.MODEL_CONVERTER,
-                             "model file sha256checksum not match")
-
-        if weight_file_path:
-            if sha256_checksum(weight_file_path) != \
-                    model_config[YAMLKeyword.weight_sha256_checksum]:
-                MaceLogger.error(ModuleName.MODEL_CONVERTER,
-                                 "weight file sha256checksum not match")
+        if cl_mem_type:
+            model_config[YAMLKeyword.cl_mem_type] = cl_mem_type
+        else:
+            model_config[YAMLKeyword.cl_mem_type] = "image"
 
         data_type = model_config[YAMLKeyword.data_type]
         # TODO(liuqi): support multiple subgraphs
@@ -642,24 +749,37 @@ def convert_model(configs):
         sh_commands.gen_model_code(
             model_codegen_dir,
             model_config[YAMLKeyword.platform],
-            model_file_path,
-            weight_file_path,
+            model_config[YAMLKeyword.model_file_path],
+            model_config[YAMLKeyword.weight_file_path],
             model_config[YAMLKeyword.model_sha256_checksum],
             model_config[YAMLKeyword.weight_sha256_checksum],
             ",".join(subgraphs[0][YAMLKeyword.input_tensors]),
+            ",".join(subgraphs[0][YAMLKeyword.input_data_types]),
+            ",".join(subgraphs[0][YAMLKeyword.input_data_formats]),
             ",".join(subgraphs[0][YAMLKeyword.output_tensors]),
+            ",".join(subgraphs[0][YAMLKeyword.output_data_types]),
+            ",".join(subgraphs[0][YAMLKeyword.output_data_formats]),
+            ",".join(subgraphs[0][YAMLKeyword.check_tensors]),
             runtime,
             model_name,
             ":".join(subgraphs[0][YAMLKeyword.input_shapes]),
+            ":".join(subgraphs[0][YAMLKeyword.input_ranges]),
+            ":".join(subgraphs[0][YAMLKeyword.output_shapes]),
+            ":".join(subgraphs[0][YAMLKeyword.check_shapes]),
             model_config[YAMLKeyword.nnlib_graph_mode],
             embed_model_data,
             model_config[YAMLKeyword.winograd],
+            model_config[YAMLKeyword.quantize],
+            model_config[YAMLKeyword.quantize_large_weights],
+            model_config[YAMLKeyword.quantize_range_file],
+            model_config[YAMLKeyword.change_concat_ranges],
             model_config[YAMLKeyword.obfuscate],
-            configs[YAMLKeyword.build_type],
+            configs[YAMLKeyword.model_graph_format],
             data_type,
-            ",".join(model_config.get(YAMLKeyword.transformers, [])))
+            model_config[YAMLKeyword.cl_mem_type],
+            ",".join(model_config.get(YAMLKeyword.graph_optimize_options, [])))
 
-        if configs[YAMLKeyword.build_type] == BuildType.proto:
+        if configs[YAMLKeyword.model_graph_format] == ModelFormat.file:
             sh.mv("-f",
                   '%s/%s.pb' % (model_codegen_dir, model_name),
                   model_output_dir)
@@ -678,192 +798,32 @@ def convert_model(configs):
             StringFormatter.block("Model %s converted" % model_name))
 
 
-def build_specific_lib(target_abi, target_soc, serial_num,
-                       configs, tuning, enable_openmp,
-                       address_sanitizer):
+def build_model_lib(configs, address_sanitizer, debug_mode):
+    MaceLogger.header(StringFormatter.block("Building model library"))
+
+    # create model library dir
     library_name = configs[YAMLKeyword.library_name]
-    build_type = configs[YAMLKeyword.build_type]
-    embed_model_data = configs[YAMLKeyword.embed_model_data]
-    linkshared = configs[YAMLKeyword.linkshared]
-    hexagon_mode = get_hexagon_mode(configs)
-    model_output_dirs = []
-
-    build_tmp_binary_dir = get_build_binary_dir(library_name, target_abi,
-                                                target_soc, serial_num)
-    if os.path.exists(build_tmp_binary_dir):
-        sh.rm("-rf", build_tmp_binary_dir)
-    os.makedirs(build_tmp_binary_dir)
-
-    sh_commands.gen_tuning_param_code(model_output_dirs)
-    if linkshared == 0:
-        mace_run_target = MACE_RUN_STATIC_TARGET
-    else:
-        mace_run_target = MACE_RUN_SHARED_TARGET
-        sh_commands.bazel_build(
-            LIBMACE_SO_TARGET,
-            abi=target_abi,
-            hexagon_mode=hexagon_mode,
-            enable_openmp=enable_openmp,
-            address_sanitizer=address_sanitizer
-        )
-        sh_commands.update_libmace_shared_library(serial_num,
-                                                  target_abi,
-                                                  library_name,
-                                                  BUILD_OUTPUT_DIR,
-                                                  OUTPUT_LIBRARY_DIR_NAME)
-
-    sh_commands.bazel_build(
-        mace_run_target,
-        abi=target_abi,
-        hexagon_mode=hexagon_mode,
-        enable_openmp=enable_openmp,
-        address_sanitizer=address_sanitizer
-    )
-    sh_commands.update_mace_run_lib(build_tmp_binary_dir, linkshared)
-    binary_changed = False
-
-    for model_name in configs[YAMLKeyword.models]:
-        model_config = configs[YAMLKeyword.models][model_name]
-        model_runtime = model_config[YAMLKeyword.runtime]
-        # Create model build directory
-        model_output_base_dir, model_output_dir, mace_model_dir = \
-            get_build_model_dirs(library_name, model_name, target_abi,
-                                 target_soc, serial_num,
-                                 model_config[YAMLKeyword.model_file_path])
-
-        model_output_dirs.append(model_output_dir)
-
-        if os.path.exists(model_output_dir):
-            sh.rm("-rf", model_output_dir)
-        os.makedirs(model_output_dir)
-
-        # build for specified soc
-        if not address_sanitizer and target_abi != ABIType.host \
-                and target_soc is not None and \
-                model_runtime in [RuntimeType.gpu, RuntimeType.cpu_gpu]:
-            sh_commands.clear_phone_data_dir(serial_num, PHONE_DATA_DIR)
-
-            subgraphs = model_config[YAMLKeyword.subgraphs]
-            # generate input data
-            sh_commands.gen_random_input(
-                model_output_dir,
-                subgraphs[0][YAMLKeyword.input_tensors],
-                subgraphs[0][YAMLKeyword.input_shapes],
-                subgraphs[0][YAMLKeyword.validation_inputs_data],
-                input_ranges=subgraphs[0][YAMLKeyword.input_ranges])
-
-            device_type = parse_device_type(RuntimeType.gpu)
-            sh_commands.tuning_run(
-                abi=target_abi,
-                serialno=serial_num,
-                mace_run_dir=build_tmp_binary_dir,
-                vlog_level=0,
-                embed_model_data=embed_model_data,
-                model_output_dir=model_output_dir,
-                input_nodes=subgraphs[0][YAMLKeyword.input_tensors],
-                output_nodes=subgraphs[0][YAMLKeyword.output_tensors],
-                input_shapes=subgraphs[0][YAMLKeyword.input_shapes],
-                output_shapes=subgraphs[0][YAMLKeyword.output_shapes],
-                mace_model_dir=mace_model_dir,
-                model_tag=model_name,
-                device_type=device_type,
-                running_round=0,
-                restart_round=1,
-                limit_opencl_kernel_time=model_config[YAMLKeyword.limit_opencl_kernel_time],  # noqa
-                tuning=tuning,
-                out_of_range_check=False,
-                phone_data_dir=PHONE_DATA_DIR,
-                build_type=build_type,
-                opencl_binary_file="",
-                shared_library_dir=get_shared_library_dir(library_name, target_abi),  # noqa
-                linkshared=linkshared,
-            )
-
-            pull_opencl_binary_and_tuning_param(target_abi, serial_num,
-                                                [model_output_dir])
-            sh_commands.touch_tuned_file_flag(build_tmp_binary_dir)
-            binary_changed = True
-
-    if binary_changed:
-        opencl_output_bin_path = get_opencl_binary_output_path(
-            library_name, target_abi, target_soc, serial_num
-        )
-        sh_commands.merge_opencl_binaries(
-            model_output_dirs, CL_COMPILED_BINARY_FILE_NAME,
-            opencl_output_bin_path)
-        sh_commands.gen_tuning_param_code(model_output_dirs)
-        sh_commands.bazel_build(
-            mace_run_target,
-            abi=target_abi,
-            hexagon_mode=hexagon_mode,
-            enable_openmp=enable_openmp,
-            address_sanitizer=address_sanitizer
-        )
-        sh_commands.update_mace_run_lib(build_tmp_binary_dir, linkshared)
-
-    if target_abi == ABIType.host:
-        sh_commands.build_host_libraries(build_type, target_abi)
-
-    # build benchmark_model binary
-    sh_commands.build_benchmark_model(target_abi,
-                                      build_tmp_binary_dir,
-                                      hexagon_mode,
-                                      enable_openmp,
-                                      linkshared)
-
-    # generate library
-    if linkshared == 0:
-        sh_commands.merge_libs(target_soc,
-                               serial_num,
-                               target_abi,
-                               library_name,
-                               BUILD_OUTPUT_DIR,
-                               OUTPUT_LIBRARY_DIR_NAME,
-                               build_type,
-                               hexagon_mode)
-
-
-def generate_library(configs, tuning, enable_openmp, address_sanitizer):
-    MaceLogger.header(StringFormatter.block("Building library"))
-    # generate source
-    MaceLogger.info('* generate common source files...')
-    sh_commands.gen_mace_version()
-    sh_commands.gen_encrypted_opencl_source()
-    MaceLogger.info('generate common source files done')
-
-    # create build dirs
-    library_name = configs[YAMLKeyword.library_name]
-    if not os.path.exists(BUILD_OUTPUT_DIR):
-        os.makedirs(BUILD_OUTPUT_DIR)
-    tmp_build_dir = os.path.join(BUILD_OUTPUT_DIR, library_name,
-                                 BUILD_TMP_DIR_NAME)
-    if not os.path.exists(tmp_build_dir):
-        os.makedirs(tmp_build_dir)
-    library_out_dir = os.path.join(BUILD_OUTPUT_DIR, library_name,
-                                   OUTPUT_LIBRARY_DIR_NAME)
-    if os.path.exists(library_out_dir):
-        sh.rm('-rf', library_out_dir)
-
-    target_socs = configs[YAMLKeyword.target_socs]
     for target_abi in configs[YAMLKeyword.target_abis]:
-        if not target_socs or target_abi == ABIType.host:
-            build_specific_lib(target_abi, None, None, configs,
-                               tuning, enable_openmp, address_sanitizer)
-        else:
-            if ALL_SOC_TAG in target_socs:
-                target_socs = sh_commands.adb_get_all_socs()
-            for target_soc in target_socs:
-                serial_nums = \
-                    sh_commands.get_target_socs_serialnos([target_soc])
-                for serial_num in serial_nums:
-                    with sh_commands.device_lock(serial_num):
-                        build_specific_lib(target_abi, target_soc, serial_num,
-                                           configs, tuning, enable_openmp,
-                                           address_sanitizer)
+        model_lib_output_path = get_model_lib_output_path(library_name,
+                                                          target_abi)
+        library_out_dir = os.path.dirname(model_lib_output_path)
+        if not os.path.exists(library_out_dir):
+            os.makedirs(library_out_dir)
+        toolchain = infer_toolchain(target_abi)
+        sh_commands.bazel_build(
+            MODEL_LIB_TARGET,
+            abi=target_abi,
+            toolchain=toolchain,
+            enable_hexagon=get_hexagon_mode(configs),
+            enable_hta=get_hta_mode(configs),
+            enable_opencl=get_opencl_mode(configs),
+            enable_quantize=get_quantize_mode(configs),
+            address_sanitizer=address_sanitizer,
+            symbol_hidden=get_symbol_hidden_mode(debug_mode),
+            debug_mode=debug_mode
+        )
 
-    # package library
-    sh_commands.packaging_lib(BUILD_OUTPUT_DIR,
-                              configs[YAMLKeyword.library_name])
+        sh.cp("-f", MODEL_LIB_PATH, model_lib_output_path)
 
 
 def print_library_summary(configs):
@@ -871,21 +831,27 @@ def print_library_summary(configs):
     title = "Library"
     header = ["key", "value"]
     data = list()
-    data.append(["library package",
-                 "%s/%s/libmace_%s.tar.gz"
-                 % (BUILD_OUTPUT_DIR, library_name, library_name)])
+    data.append(["MACE Model Path",
+                 "%s/%s/%s"
+                 % (BUILD_OUTPUT_DIR, library_name, MODEL_OUTPUT_DIR_NAME)])
+    if configs[YAMLKeyword.model_graph_format] == ModelFormat.code:
+        data.append(["MACE Model Header Path",
+                     "%s/%s/%s"
+                     % (BUILD_OUTPUT_DIR, library_name,
+                        MODEL_HEADER_DIR_PATH)])
+
     MaceLogger.summary(StringFormatter.table(header, data, title))
 
 
-def build_library(flags):
+def convert_func(flags):
     configs = format_model_config(flags)
 
-    print_configuration(flags, configs)
+    print_configuration(configs)
 
-    convert_model(configs)
+    convert_model(configs, flags.cl_mem_type)
 
-    generate_library(configs, flags.disable_tuning,
-                     flags.disable_openmp, flags.address_sanitizer)
+    if configs[YAMLKeyword.model_graph_format] == ModelFormat.code:
+        build_model_lib(configs, flags.address_sanitizer, flags.debug_mode)
 
     print_library_summary(configs)
 
@@ -893,317 +859,272 @@ def build_library(flags):
 ################################
 # run
 ################################
-def report_run_statistics(stdout,
-                          abi,
-                          serialno,
-                          model_name,
-                          device_type,
-                          output_dir,
-                          tuned):
-    metrics = [0] * 3
-    for line in stdout.split('\n'):
-        line = line.strip()
-        parts = line.split()
-        if len(parts) == 4 and parts[0].startswith("time"):
-            metrics[0] = str(float(parts[1]))
-            metrics[1] = str(float(parts[2]))
-            metrics[2] = str(float(parts[3]))
-            break
-
-    device_name = ""
-    target_soc = ""
-    if abi != "host":
-        props = sh_commands.adb_getprop_by_serialno(serialno)
-        device_name = props.get("ro.product.model", "")
-        target_soc = props.get("ro.board.platform", "")
-
-    report_filename = output_dir + "/report.csv"
-    if not os.path.exists(report_filename):
-        with open(report_filename, 'w') as f:
-            f.write("model_name,device_name,soc,abi,runtime,"
-                    "init,warmup,run_avg,tuned\n")
-
-    data_str = "{model_name},{device_name},{soc},{abi},{device_type}," \
-               "{init},{warmup},{run_avg},{tuned}\n" \
-        .format(model_name=model_name,
-                device_name=device_name,
-                soc=target_soc,
-                abi=abi,
-                device_type=device_type,
-                init=metrics[0],
-                warmup=metrics[1],
-                run_avg=metrics[2],
-                tuned=tuned,
-                )
-    with open(report_filename, 'a') as f:
-        f.write(data_str)
-
-
-def run_specific_target(flags, configs, target_abi,
-                        target_soc, serial_num):
+def build_mace_run(configs, target_abi, toolchain, enable_openmp,
+                   address_sanitizer, mace_lib_type, debug_mode):
     library_name = configs[YAMLKeyword.library_name]
-    build_type = configs[YAMLKeyword.build_type]
-    embed_model_data = configs[YAMLKeyword.embed_model_data]
-    opencl_output_bin_path = ""
-    linkshared = configs[YAMLKeyword.linkshared]
-    if not configs[YAMLKeyword.target_socs]:
-        build_tmp_binary_dir = get_build_binary_dir(library_name, target_abi,
-                                                    None, None)
-    else:
-        build_tmp_binary_dir = get_build_binary_dir(library_name, target_abi,
-                                                    target_soc, serial_num)
-        opencl_output_bin_path = get_opencl_binary_output_path(
-            library_name, target_abi, target_soc, serial_num
-        )
-    mace_check(os.path.exists(build_tmp_binary_dir),
-               ModuleName.RUN,
-               'You should build before run.')
 
-    for model_name in configs[YAMLKeyword.models]:
-        if target_abi == ABIType.host:
-            device_name = ABIType.host
-        else:
-            device_name =\
-                sh_commands.adb_get_device_name_by_serialno(serial_num)
-        MaceLogger.header(
-            StringFormatter.block(
-                "Run model %s on %s" % (model_name, device_name)))
-        model_config = configs[YAMLKeyword.models][model_name]
-        model_runtime = model_config[YAMLKeyword.runtime]
-        subgraphs = model_config[YAMLKeyword.subgraphs]
+    build_tmp_binary_dir = get_build_binary_dir(library_name, target_abi)
+    if os.path.exists(build_tmp_binary_dir):
+        sh.rm("-rf", build_tmp_binary_dir)
+    os.makedirs(build_tmp_binary_dir)
 
-        if not configs[YAMLKeyword.target_socs]:
-            model_output_base_dir, model_output_dir, mace_model_dir = \
-                get_build_model_dirs(library_name, model_name, target_abi,
-                                     None, None,
-                                     model_config[YAMLKeyword.model_file_path])
-        else:
-            model_output_base_dir, model_output_dir, mace_model_dir = \
-                get_build_model_dirs(library_name, model_name, target_abi,
-                                     target_soc, serial_num,
-                                     model_config[YAMLKeyword.model_file_path])
-        mace_check(os.path.exists(model_output_dir)
-                   and os.path.exists(mace_model_dir),
+    mace_run_target = MACE_RUN_STATIC_TARGET
+    if mace_lib_type == MACELibType.dynamic:
+        mace_run_target = MACE_RUN_DYNAMIC_TARGET
+    build_arg = ""
+    if configs[YAMLKeyword.model_graph_format] == ModelFormat.code:
+        mace_check(os.path.exists(ENGINE_CODEGEN_DIR),
                    ModuleName.RUN,
-                   'You should build before run.')
-        if target_abi != ABIType.host:
-            sh_commands.clear_phone_data_dir(serial_num, PHONE_DATA_DIR)
+                   "You should convert model first.")
+        build_arg = "--per_file_copt=mace/tools/validation/mace_run.cc@-DMODEL_GRAPH_FORMAT_CODE"  # noqa
 
-        # generate input data
-        sh_commands.gen_random_input(
-            model_output_dir,
-            subgraphs[0][YAMLKeyword.input_tensors],
-            subgraphs[0][YAMLKeyword.input_shapes],
-            subgraphs[0][YAMLKeyword.validation_inputs_data],
-            input_ranges=subgraphs[0][YAMLKeyword.input_ranges])
-        runtime_list = []
-        if target_abi == ABIType.host:
-            runtime_list.extend([RuntimeType.cpu])
-        elif model_runtime == RuntimeType.cpu_gpu:
-            runtime_list.extend([RuntimeType.cpu, RuntimeType.gpu])
-        else:
-            runtime_list.extend([model_runtime])
-        for runtime in runtime_list:
-            device_type = parse_device_type(runtime)
+    sh_commands.bazel_build(
+        mace_run_target,
+        abi=target_abi,
+        toolchain=toolchain,
+        enable_hexagon=get_hexagon_mode(configs),
+        enable_hta=get_hta_mode(configs),
+        enable_openmp=enable_openmp,
+        enable_opencl=get_opencl_mode(configs),
+        enable_quantize=get_quantize_mode(configs),
+        address_sanitizer=address_sanitizer,
+        symbol_hidden=get_symbol_hidden_mode(debug_mode, mace_lib_type),
+        debug_mode=debug_mode,
+        extra_args=build_arg
+    )
+    sh_commands.update_mace_run_binary(build_tmp_binary_dir,
+                                       mace_lib_type == MACELibType.dynamic)
 
-            run_output = sh_commands.tuning_run(
-                abi=target_abi,
-                serialno=serial_num,
-                mace_run_dir=build_tmp_binary_dir,
-                vlog_level=flags.vlog_level,
-                embed_model_data=embed_model_data,
-                model_output_dir=model_output_dir,
-                input_nodes=subgraphs[0][YAMLKeyword.input_tensors],
-                output_nodes=subgraphs[0][YAMLKeyword.output_tensors],
-                input_shapes=subgraphs[0][YAMLKeyword.input_shapes],
-                output_shapes=subgraphs[0][YAMLKeyword.output_shapes],
-                mace_model_dir=mace_model_dir,
-                model_tag=model_name,
-                device_type=device_type,
-                running_round=flags.round,
-                restart_round=flags.restart_round,
-                limit_opencl_kernel_time=model_config[YAMLKeyword.limit_opencl_kernel_time],  # noqa
-                tuning=False,
-                out_of_range_check=flags.gpu_out_of_range_check,
-                phone_data_dir=PHONE_DATA_DIR,
-                build_type=build_type,
-                omp_num_threads=flags.omp_num_threads,
-                cpu_affinity_policy=flags.cpu_affinity_policy,
-                gpu_perf_hint=flags.gpu_perf_hint,
-                gpu_priority_hint=flags.gpu_priority_hint,
-                runtime_failure_ratio=flags.runtime_failure_ratio,
-                address_sanitizer=flags.address_sanitizer,
-                opencl_binary_file=opencl_output_bin_path,
-                shared_library_dir=get_shared_library_dir(library_name, target_abi),  # noqa
-                linkshared=linkshared,
-            )
-            if flags.validate:
-                model_file_path, weight_file_path = get_model_files_path(
-                    model_config[YAMLKeyword.model_file_path],
-                    model_output_base_dir,
-                    model_config[YAMLKeyword.weight_file_path])
 
-                sh_commands.validate_model(
-                    abi=target_abi,
-                    serialno=serial_num,
-                    model_file_path=model_file_path,
-                    weight_file_path=weight_file_path,
-                    platform=model_config[YAMLKeyword.platform],
-                    device_type=device_type,
-                    input_nodes=subgraphs[0][YAMLKeyword.input_tensors],
-                    output_nodes=subgraphs[0][YAMLKeyword.output_tensors],
-                    input_shapes=subgraphs[0][YAMLKeyword.input_shapes],
-                    output_shapes=subgraphs[0][YAMLKeyword.output_shapes],
-                    model_output_dir=model_output_dir,
-                    phone_data_dir=PHONE_DATA_DIR,
-                    caffe_env=flags.caffe_env)
-            if flags.report and flags.round > 0:
-                report_run_statistics(
-                    run_output, target_abi, serial_num,
-                    model_name, device_type, flags.report_dir,
-                    sh_commands.is_binary_tuned(build_tmp_binary_dir))
+def build_example(configs, target_abi, toolchain, enable_openmp, mace_lib_type,
+                  cl_binary_to_code, device, debug_mode):
+    library_name = configs[YAMLKeyword.library_name]
+
+    build_tmp_binary_dir = get_build_binary_dir(library_name, target_abi)
+    if os.path.exists(build_tmp_binary_dir):
+        sh.rm("-rf", build_tmp_binary_dir)
+    os.makedirs(build_tmp_binary_dir)
+
+    if cl_binary_to_code:
+        sh_commands.gen_opencl_binary_cpps(
+            get_opencl_binary_output_path(
+                library_name, target_abi, device),
+            get_opencl_parameter_output_path(
+                library_name, target_abi, device),
+            OPENCL_CODEGEN_DIR + '/opencl_binary.cc',
+            OPENCL_CODEGEN_DIR + '/opencl_parameter.cc')
+    else:
+        sh_commands.gen_opencl_binary_cpps(
+            "", "",
+            OPENCL_CODEGEN_DIR + '/opencl_binary.cc',
+            OPENCL_CODEGEN_DIR + '/opencl_parameter.cc')
+
+    libmace_target = LIBMACE_STATIC_TARGET
+    if mace_lib_type == MACELibType.dynamic:
+        libmace_target = LIBMACE_SO_TARGET
+
+    sh_commands.bazel_build(libmace_target,
+                            abi=target_abi,
+                            toolchain=toolchain,
+                            enable_openmp=enable_openmp,
+                            enable_opencl=get_opencl_mode(configs),
+                            enable_quantize=get_quantize_mode(configs),
+                            enable_hexagon=get_hexagon_mode(configs),
+                            enable_hta=get_hta_mode(configs),
+                            address_sanitizer=flags.address_sanitizer,
+                            symbol_hidden=get_symbol_hidden_mode(debug_mode, mace_lib_type),  # noqa
+                            debug_mode=debug_mode)
+
+    if os.path.exists(LIB_CODEGEN_DIR):
+        sh.rm("-rf", LIB_CODEGEN_DIR)
+    sh.mkdir("-p", LIB_CODEGEN_DIR)
+
+    build_arg = ""
+    if configs[YAMLKeyword.model_graph_format] == ModelFormat.code:
+        mace_check(os.path.exists(ENGINE_CODEGEN_DIR),
+                   ModuleName.RUN,
+                   "You should convert model first.")
+        model_lib_path = get_model_lib_output_path(library_name,
+                                                   target_abi)
+        sh.cp("-f", model_lib_path, LIB_CODEGEN_DIR)
+        build_arg = "--per_file_copt=examples/cli/example.cc@-DMODEL_GRAPH_FORMAT_CODE"  # noqa
+
+    if mace_lib_type == MACELibType.dynamic:
+        example_target = EXAMPLE_DYNAMIC_TARGET
+        sh.cp("-f", LIBMACE_DYNAMIC_PATH, LIB_CODEGEN_DIR)
+    else:
+        example_target = EXAMPLE_STATIC_TARGET
+        sh.cp("-f", LIBMACE_STATIC_PATH, LIB_CODEGEN_DIR)
+
+    sh_commands.bazel_build(example_target,
+                            abi=target_abi,
+                            toolchain=toolchain,
+                            enable_openmp=enable_openmp,
+                            enable_opencl=get_opencl_mode(configs),
+                            enable_quantize=get_quantize_mode(configs),
+                            enable_hexagon=get_hexagon_mode(configs),
+                            enable_hta=get_hta_mode(configs),
+                            address_sanitizer=flags.address_sanitizer,
+                            debug_mode=debug_mode,
+                            extra_args=build_arg)
+
+    target_bin = "/".join(sh_commands.bazel_target_to_bin(example_target))
+    sh.cp("-f", target_bin, build_tmp_binary_dir)
+    if os.path.exists(LIB_CODEGEN_DIR):
+        sh.rm("-rf", LIB_CODEGEN_DIR)
+
+
+def print_package_summary(package_path):
+    title = "Library"
+    header = ["key", "value"]
+    data = list()
+    data.append(["MACE Model package Path",
+                 package_path])
+
+    MaceLogger.summary(StringFormatter.table(header, data, title))
 
 
 def run_mace(flags):
     configs = format_model_config(flags)
 
-    target_socs = configs[YAMLKeyword.target_socs]
-    if not target_socs or ALL_SOC_TAG in target_socs:
-        target_socs = sh_commands.adb_get_all_socs()
+    clear_build_dirs(configs[YAMLKeyword.library_name])
 
+    target_socs = configs[YAMLKeyword.target_socs]
+    device_list = DeviceManager.list_devices(flags.device_yml)
+    if target_socs and TargetSOCTag.all not in target_socs:
+        device_list = [dev for dev in device_list
+                       if dev[YAMLKeyword.target_socs].lower() in target_socs]
     for target_abi in configs[YAMLKeyword.target_abis]:
-        if target_abi == ABIType.host:
-            run_specific_target(flags, configs, target_abi, None, None)
+        if flags.target_socs == TargetSOCTag.random:
+            target_devices = sh_commands.choose_a_random_device(
+                device_list, target_abi)
         else:
-            for target_soc in target_socs:
-                serial_nums = \
-                    sh_commands.get_target_socs_serialnos([target_soc])
-                mace_check(serial_nums,
-                           ModuleName.RUN,
-                           'There is no device with soc: ' + target_soc)
-                for serial_num in serial_nums:
-                    with sh_commands.device_lock(serial_num):
-                        run_specific_target(flags, configs, target_abi,
-                                            target_soc, serial_num)
+            target_devices = device_list
+        # build target
+        for dev in target_devices:
+            if target_abi in dev[YAMLKeyword.target_abis]:
+                # get toolchain
+                toolchain = infer_toolchain(target_abi)
+                device = DeviceWrapper(dev)
+                if flags.example:
+                    build_example(configs,
+                                  target_abi,
+                                  toolchain,
+                                  flags.enable_openmp,
+                                  flags.mace_lib_type,
+                                  flags.cl_binary_to_code,
+                                  device,
+                                  flags.debug_mode)
+                else:
+                    build_mace_run(configs,
+                                   target_abi,
+                                   toolchain,
+                                   flags.enable_openmp,
+                                   flags.address_sanitizer,
+                                   flags.mace_lib_type,
+                                   flags.debug_mode)
+                # run
+                start_time = time.time()
+                with device.lock():
+                    device.run_specify_abi(flags, configs, target_abi)
+                elapse_minutes = (time.time() - start_time) / 60
+                print("Elapse time: %f minutes." % elapse_minutes)
+            elif dev[YAMLKeyword.device_name] != SystemType.host:
+                six.print_('The device with soc %s do not support abi %s' %
+                           (dev[YAMLKeyword.target_socs], target_abi),
+                           file=sys.stderr)
+
+    # package the output files
+    package_path = sh_commands.packaging_lib(BUILD_OUTPUT_DIR,
+                                             configs[YAMLKeyword.library_name])
+    print_package_summary(package_path)
 
 
 ################################
 #  benchmark model
 ################################
-def bm_specific_target(flags, configs, target_abi, target_soc, serial_num):
+def build_benchmark_model(configs,
+                          target_abi,
+                          toolchain,
+                          enable_openmp,
+                          mace_lib_type,
+                          debug_mode):
     library_name = configs[YAMLKeyword.library_name]
-    build_type = configs[YAMLKeyword.build_type]
-    embed_model_data = configs[YAMLKeyword.embed_model_data]
-    opencl_output_bin_path = ""
-    linkshared = configs[YAMLKeyword.linkshared]
-    if not configs[YAMLKeyword.target_socs]:
-        build_tmp_binary_dir = get_build_binary_dir(library_name, target_abi,
-                                                    None, None)
+
+    link_dynamic = mace_lib_type == MACELibType.dynamic
+    if link_dynamic:
+        benchmark_target = BM_MODEL_DYNAMIC_TARGET
     else:
-        build_tmp_binary_dir = get_build_binary_dir(library_name, target_abi,
-                                                    target_soc, serial_num)
-        opencl_output_bin_path = get_opencl_binary_output_path(
-            library_name, target_abi, target_soc, serial_num
-        )
-    mace_check(os.path.exists(build_tmp_binary_dir),
-               ModuleName.BENCHMARK,
-               'You should build before benchmark.')
+        benchmark_target = BM_MODEL_STATIC_TARGET
 
-    for model_name in configs[YAMLKeyword.models]:
-        if target_abi == ABIType.host:
-            device_name = ABIType.host
-        else:
-            device_name = \
-                sh_commands.adb_get_device_name_by_serialno(serial_num)
-        MaceLogger.header(
-            StringFormatter.block(
-                "Benchmark model %s on %s" % (model_name, device_name)))
-        model_config = configs[YAMLKeyword.models][model_name]
-        model_runtime = model_config[YAMLKeyword.runtime]
-        subgraphs = model_config[YAMLKeyword.subgraphs]
-
-        if not configs[YAMLKeyword.target_socs]:
-            model_output_base_dir, model_output_dir, mace_model_dir = \
-                get_build_model_dirs(library_name, model_name, target_abi,
-                                     None, None,
-                                     model_config[YAMLKeyword.model_file_path])
-        else:
-            model_output_base_dir, model_output_dir, mace_model_dir = \
-                get_build_model_dirs(library_name, model_name, target_abi,
-                                     target_soc, serial_num,
-                                     model_config[YAMLKeyword.model_file_path])
-        mace_check(os.path.exists(model_output_dir)
-                   and os.path.exists(mace_model_dir),
+    build_arg = ""
+    if configs[YAMLKeyword.model_graph_format] == ModelFormat.code:
+        mace_check(os.path.exists(ENGINE_CODEGEN_DIR),
                    ModuleName.BENCHMARK,
-                   'You should build before benchmark.')
-        if target_abi != ABIType.host:
-            sh_commands.clear_phone_data_dir(serial_num, PHONE_DATA_DIR)
+                   "You should convert model first.")
+        build_arg = "--per_file_copt=mace/tools/benchmark/benchmark_model.cc@-DMODEL_GRAPH_FORMAT_CODE"  # noqa
 
-        sh_commands.gen_random_input(
-            model_output_dir,
-            subgraphs[0][YAMLKeyword.input_tensors],
-            subgraphs[0][YAMLKeyword.input_shapes],
-            subgraphs[0][YAMLKeyword.validation_inputs_data],
-            input_ranges=subgraphs[0][YAMLKeyword.input_ranges])
-        runtime_list = []
-        if target_abi == ABIType.host:
-            runtime_list.extend([RuntimeType.cpu])
-        elif model_runtime == RuntimeType.cpu_gpu:
-            runtime_list.extend([RuntimeType.cpu, RuntimeType.gpu])
-        else:
-            runtime_list.extend([model_runtime])
-        for runtime in runtime_list:
-            device_type = parse_device_type(runtime)
-            sh_commands.benchmark_model(
-                abi=target_abi,
-                serialno=serial_num,
-                benchmark_binary_dir=build_tmp_binary_dir,
-                vlog_level=0,
-                embed_model_data=embed_model_data,
-                model_output_dir=model_output_dir,
-                input_nodes=subgraphs[0][YAMLKeyword.input_tensors],
-                output_nodes=subgraphs[0][YAMLKeyword.output_tensors],
-                input_shapes=subgraphs[0][YAMLKeyword.input_shapes],
-                output_shapes=subgraphs[0][YAMLKeyword.output_shapes],
-                mace_model_dir=mace_model_dir,
-                model_tag=model_name,
-                device_type=device_type,
-                phone_data_dir=PHONE_DATA_DIR,
-                build_type=build_type,
-                omp_num_threads=flags.omp_num_threads,
-                cpu_affinity_policy=flags.cpu_affinity_policy,
-                gpu_perf_hint=flags.gpu_perf_hint,
-                gpu_priority_hint=flags.gpu_priority_hint,
-                opencl_binary_file=opencl_output_bin_path,
-                shared_library_dir=get_shared_library_dir(library_name, target_abi),  # noqa
-                linkshared=linkshared)
+    sh_commands.bazel_build(benchmark_target,
+                            abi=target_abi,
+                            toolchain=toolchain,
+                            enable_openmp=enable_openmp,
+                            enable_opencl=get_opencl_mode(configs),
+                            enable_quantize=get_quantize_mode(configs),
+                            enable_hexagon=get_hexagon_mode(configs),
+                            enable_hta=get_hta_mode(configs),
+                            symbol_hidden=get_symbol_hidden_mode(debug_mode, mace_lib_type),  # noqa
+                            debug_mode=debug_mode,
+                            extra_args=build_arg)
+    # clear tmp binary dir
+    build_tmp_binary_dir = get_build_binary_dir(library_name, target_abi)
+    if os.path.exists(build_tmp_binary_dir):
+        sh.rm("-rf", build_tmp_binary_dir)
+    os.makedirs(build_tmp_binary_dir)
+
+    target_bin = "/".join(sh_commands.bazel_target_to_bin(benchmark_target))
+    sh.cp("-f", target_bin, build_tmp_binary_dir)
 
 
 def benchmark_model(flags):
     configs = format_model_config(flags)
 
-    target_socs = configs[YAMLKeyword.target_socs]
-    if not target_socs or ALL_SOC_TAG in target_socs:
-        target_socs = sh_commands.adb_get_all_socs()
+    clear_build_dirs(configs[YAMLKeyword.library_name])
 
+    target_socs = configs[YAMLKeyword.target_socs]
+    device_list = DeviceManager.list_devices(flags.device_yml)
+    if target_socs and TargetSOCTag.all not in target_socs:
+        device_list = [dev for dev in device_list
+                       if dev[YAMLKeyword.target_socs].lower() in target_socs]
     for target_abi in configs[YAMLKeyword.target_abis]:
-        if target_abi == ABIType.host:
-            bm_specific_target(flags, configs, target_abi, None, None)
+        if flags.target_socs == TargetSOCTag.random:
+            target_devices = sh_commands.choose_a_random_device(
+                device_list, target_abi)
         else:
-            for target_soc in target_socs:
-                serial_nums = \
-                    sh_commands.get_target_socs_serialnos([target_soc])
-                mace_check(serial_nums,
-                           ModuleName.BENCHMARK,
-                           'There is no device with soc: ' + target_soc)
-                for serial_num in serial_nums:
-                    with sh_commands.device_lock(serial_num):
-                        bm_specific_target(flags, configs, target_abi,
-                                           target_soc, serial_num)
+            target_devices = device_list
+        # build benchmark_model binary
+        for dev in target_devices:
+            if target_abi in dev[YAMLKeyword.target_abis]:
+                toolchain = infer_toolchain(target_abi)
+                build_benchmark_model(configs,
+                                      target_abi,
+                                      toolchain,
+                                      flags.enable_openmp,
+                                      flags.mace_lib_type,
+                                      flags.debug_mode)
+                device = DeviceWrapper(dev)
+                start_time = time.time()
+                with device.lock():
+                    device.bm_specific_target(flags, configs, target_abi)
+                elapse_minutes = (time.time() - start_time) / 60
+                print("Elapse time: %f minutes." % elapse_minutes)
+            else:
+                six.print_('There is no abi %s with soc %s' %
+                           (target_abi, dev[YAMLKeyword.target_socs]),
+                           file=sys.stderr)
 
 
 ################################
-# Parsing arguments
+# parsing arguments
 ################################
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -1223,6 +1144,15 @@ def str_to_caffe_env_type(v):
         raise argparse.ArgumentTypeError('[docker | local] expected.')
 
 
+def str_to_mace_lib_type(v):
+    if v.lower() == 'dynamic':
+        return MACELibType.dynamic
+    elif v.lower() == 'static':
+        return MACELibType.static
+    else:
+        raise argparse.ArgumentTypeError('[dynamic| static] expected.')
+
+
 def parse_args():
     """Parses command line arguments."""
     all_type_parent_parser = argparse.ArgumentParser(add_help=False)
@@ -1233,21 +1163,44 @@ def parse_args():
         required=True,
         help="the path of model yaml configuration file.")
     all_type_parent_parser.add_argument(
-        "--build_type",
+        "--model_graph_format",
         type=str,
         default="",
-        help="Model build type, can be ['proto', 'code'].")
+        help="[file, code], MACE Model graph format.")
+    all_type_parent_parser.add_argument(
+        "--model_data_format",
+        type=str,
+        default="",
+        help="['file', 'code'], MACE Model data format.")
     all_type_parent_parser.add_argument(
         "--target_abis",
         type=str,
         default="",
         help="Target ABIs, comma seperated list.")
-    build_run_parent_parser = argparse.ArgumentParser(add_help=False)
-    build_run_parent_parser.add_argument(
+    all_type_parent_parser.add_argument(
+        "--target_socs",
+        type=str,
+        default="",
+        help="Target SOCs, comma seperated list.")
+    all_type_parent_parser.add_argument(
+        "--debug_mode",
+        action="store_true",
+        help="Reserve debug symbols.")
+    convert_run_parent_parser = argparse.ArgumentParser(add_help=False)
+    convert_run_parent_parser.add_argument(
         '--address_sanitizer',
         action="store_true",
         help="Whether to use address sanitizer to check memory error")
     run_bm_parent_parser = argparse.ArgumentParser(add_help=False)
+    run_bm_parent_parser.add_argument(
+        "--mace_lib_type",
+        type=str_to_mace_lib_type,
+        default=DefaultValues.mace_lib_type,
+        help="[static | dynamic], Which type MACE library to use.")
+    run_bm_parent_parser.add_argument(
+        "--enable_openmp",
+        action="store_true",
+        help="Enable openmp for multiple thread.")
     run_bm_parent_parser.add_argument(
         "--omp_num_threads",
         type=int,
@@ -1268,28 +1221,34 @@ def parse_args():
         type=int,
         default=DefaultValues.gpu_priority_hint,
         help="0:DEFAULT/1:LOW/2:NORMAL/3:HIGH")
-
+    run_bm_parent_parser.add_argument(
+        "--device_yml",
+        type=str,
+        default='',
+        help='embedded linux device config yml file'
+    )
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers()
-    build = subparsers.add_parser(
-        'build',
-        parents=[all_type_parent_parser, build_run_parent_parser],
-        help='build model library and test tools')
-    build.set_defaults(func=build_library)
-    build.add_argument(
-        '--disable_tuning',
-        action="store_false",
-        help="Disable tuning the parameters for the GPU of specified SoC.")
-    build.add_argument(
-        "--disable_openmp",
-        action="store_false",
-        help="Disable openmp for multiple thread.")
+    convert = subparsers.add_parser(
+        'convert',
+        parents=[all_type_parent_parser, convert_run_parent_parser],
+        help='convert to mace model (file or code)')
+    convert.add_argument(
+        "--cl_mem_type",
+        type=str,
+        default=None,
+        help="Which type of OpenCL memory type to use [image | buffer].")
+    convert.set_defaults(func=convert_func)
     run = subparsers.add_parser(
         'run',
         parents=[all_type_parent_parser, run_bm_parent_parser,
-                 build_run_parent_parser],
+                 convert_run_parent_parser],
         help='run model in command line')
     run.set_defaults(func=run_mace)
+    run.add_argument(
+        "--disable_tuning",
+        action="store_true",
+        help="Disable tuning for specific thread.")
     run.add_argument(
         "--round",
         type=int,
@@ -1300,6 +1259,12 @@ def parse_args():
         action="store_true",
         help="whether to verify the results are consistent with "
              "the frameworks.")
+    run.add_argument(
+        "--layers",
+        type=str,
+        default="-1",
+        help="'start_layer:end_layer' or 'layer', similar to python slice."
+             " Use with --validate flag.")
     run.add_argument(
         "--caffe_env",
         type=str_to_caffe_env_type,
@@ -1334,12 +1299,43 @@ def parse_args():
         type=float,
         default=0.0,
         help="[mock runtime failure ratio].")
+    run.add_argument(
+        "--example",
+        action="store_true",
+        help="whether to run example.")
+    run.add_argument(
+        "--quantize_stat",
+        action="store_true",
+        help="whether to stat quantization range.")
+    run.add_argument(
+        "--input_dir",
+        type=str,
+        default="",
+        help="quantize stat input dir.")
+    run.add_argument(
+        "--output_dir",
+        type=str,
+        default="",
+        help="quantize stat output dir.")
+    run.add_argument(
+        "--cl_binary_to_code",
+        action="store_true",
+        help="convert OpenCL binaries to cpp.")
     benchmark = subparsers.add_parser(
         'benchmark',
-        parents=[all_type_parent_parser, run_bm_parent_parser,
-                 build_run_parent_parser],
+        parents=[all_type_parent_parser, run_bm_parent_parser],
         help='benchmark model for detail information')
     benchmark.set_defaults(func=benchmark_model)
+    benchmark.add_argument(
+        "--max_num_runs",
+        type=int,
+        default=100,
+        help="max number of runs.")
+    benchmark.add_argument(
+        "--max_seconds",
+        type=float,
+        default=10.0,
+        help="max number of seconds to run.")
     return parser.parse_known_args()
 
 

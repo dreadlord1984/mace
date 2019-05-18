@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,38 +15,12 @@
 #ifndef MACE_OPS_ELTWISE_H_
 #define MACE_OPS_ELTWISE_H_
 
-#include "mace/core/operator.h"
-#include "mace/kernels/eltwise.h"
+#include "mace/ops/common/eltwise_type.h"
 
 namespace mace {
 namespace ops {
 
-template <DeviceType D, typename T>
-class EltwiseOp : public Operator<D, T> {
- public:
-  EltwiseOp(const OperatorDef &op_def, Workspace *ws)
-      : Operator<D, T>(op_def, ws),
-        functor_(
-            static_cast<kernels::EltwiseType>(OperatorBase::GetOptionalArg<int>(
-                "type", static_cast<int>(kernels::EltwiseType::NONE))),
-            OperatorBase::GetRepeatedArgs<float>("coeff"),
-            OperatorBase::GetOptionalArg<float>("value", 1.0),
-            static_cast<DataFormat>(OperatorBase::GetOptionalArg<int>(
-                "data_format", 0))) {}
-
-  MaceStatus Run(StatsFuture *future) override {
-    const Tensor *input0 = this->Input(0);
-    const Tensor *input1 = this->InputSize() == 2 ? this->Input(1) : nullptr;
-    Tensor *output = this->Output(OUTPUT);
-    return functor_(input0, input1, output, future);
-  }
-
- private:
-  kernels::EltwiseFunctor<D, T> functor_;
-
- private:
-  MACE_OP_OUTPUT_TAGS(OUTPUT);
-};
+inline bool IsLogicalType(EltwiseType type) { return type == EQUAL; }
 
 }  // namespace ops
 }  // namespace mace

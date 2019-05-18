@@ -1,4 +1,4 @@
-// Copyright 2018 Xiaomi, Inc.  All rights reserved.
+// Copyright 2018 The MACE Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,42 +15,46 @@
 #ifndef MACE_OPS_DECONV_2D_H_
 #define MACE_OPS_DECONV_2D_H_
 
-#include <memory>
+#include <algorithm>
+#include <string>
+#include <vector>
 
 #include "mace/core/operator.h"
-#include "mace/kernels/deconv_2d.h"
-#include "mace/ops/conv_pool_2d_base.h"
+#include "mace/core/types.h"
+#include "mace/ops/activation.h"
+#include "mace/ops/common/conv_pool_2d_util.h"
 
 namespace mace {
 namespace ops {
 
-template <DeviceType D, typename T>
-class Deconv2dOp : public ConvPool2dOpBase<D, T> {
+class Deconv2dOpBase : public Operation {
  public:
-  Deconv2dOp(const OperatorDef &op_def, Workspace *ws)
-      : ConvPool2dOpBase<D, T>(op_def, ws),
-        functor_(this->strides_.data(),
-                 this->padding_type_,
-                 this->paddings_,
-                 OperatorBase::GetRepeatedArgs<index_t>("output_shape"),
-                 kernels::ActivationType::NOOP,
-                 0.0f) {}
-
-  MaceStatus Run(StatsFuture *future) override {
-    const Tensor *input = this->Input(INPUT);
-    const Tensor *filter = this->Input(FILTER);
-    const Tensor *bias = this->InputSize() >= 3 ? this->Input(BIAS) : nullptr;
-    Tensor *output = this->Output(OUTPUT);
-
-    return functor_(input, filter, bias, output, future);
-  }
-
- private:
-  kernels::Deconv2dFunctor<D, T> functor_;
+  explicit Deconv2dOpBase(OpConstructContext *context)
+      : Operation(context),
+        strides_(Operation::GetRepeatedArgs<int>("strides")),
+        padding_type_(static_cast<Padding>(Operation::GetOptionalArg<int>(
+            "padding", static_cast<int>(SAME)))),
+        paddings_(Operation::GetRepeatedArgs<int>("padding_values")),
+        group_(Operation::GetOptionalArg<int>("group", 1)),
+        model_type_(static_cast<FrameworkType>(
+                        Operation::GetOptionalArg<int>("framework_type", 0))),
+        activation_(ops::StringToActivationType(
+            Operation::GetOptionalArg<std::string>("activation",
+                                                   "NOOP"))),
+        relux_max_limit_(
+            Operation::GetOptionalArg<float>("max_limit", 0.0f)),
+        leakyrelu_coefficient_(
+            Operation::GetOptionalArg<float>("leakyrelu_coefficient", 0.0f)) {}
 
  protected:
-  MACE_OP_INPUT_TAGS(INPUT, FILTER, BIAS);
-  MACE_OP_OUTPUT_TAGS(OUTPUT);
+  std::vector<int> strides_;  // [stride_h, stride_w]
+  const Padding padding_type_;
+  std::vector<int> paddings_;
+  const int group_;
+  const FrameworkType model_type_;
+  const ActivationType activation_;
+  const float relux_max_limit_;
+  const float leakyrelu_coefficient_;
 };
 
 }  // namespace ops
